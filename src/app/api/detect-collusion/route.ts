@@ -128,8 +128,8 @@ export async function POST(req: NextRequest) {
 
     // Fetch all submitted sessions for this exam
     const { data: sessionsRaw, error: sessionsError } = await supabase.rpc(
-      "get_exam_sessions_for_collusion",
-      { exam_id_param: exam_id, teacher_id_param: user.id }
+      'get_exam_sessions_for_collusion',
+      { exam_id_param: exam_id }
     );
 
     if (sessionsError) {
@@ -203,13 +203,12 @@ export async function POST(req: NextRequest) {
     for (const pair of suspiciousPairs) {
       const sessionA = sessions.find((s) => s.student_id === pair.student_a_id);
       if (sessionA) {
-        await supabase.rpc("insert_flag", {
+        await supabase.rpc('insert_flag', {
           session_id_param: sessionA.session_id,
           student_id_param: pair.student_a_id,
           exam_id_param: exam_id,
-          flag_type_param: "collusion_suspected",
+          flag_type_param: 'collusion_suspected',
           severity_param: pair.severity,
-          screenshot_url_param: null,
           metadata_param: {
             similarity_score: pair.similarity_score,
             compared_with: pair.student_b_id,
@@ -217,7 +216,7 @@ export async function POST(req: NextRequest) {
             matching_questions: pair.matching_questions,
             total_questions: pair.total_questions,
           },
-        }).maybeSingle();
+        });
       }
     }
 

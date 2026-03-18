@@ -35,7 +35,9 @@ async function gradeSubjectiveAnswer({
   gradingHint,
   allowSpellingMistakes = false,
 }: GradeSubjectiveParams): Promise<{ marks: number; is_correct: boolean }> {
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+  // Try multiple model names in fallback order
+  // Available free-tier models that work with Generative AI API
+  const modelNames = ['gemini-2.5-flash', 'gemini-2.5-flash-exp', 'gemini-2.5-pro']
 
   const prompt = `You are an exam grader. Grade the student's answer strictly and fairly.
 
@@ -51,21 +53,33 @@ Instructions:
 - Be strict: only award full marks if the answer is complete and correct.
 - Award partial marks proportionally for partially correct answers.
 - A short answer is "correct" if marks awarded >= 50% of max marks.
+- The student's answer does not need to match word-for-word — judge based on meaning and correctness.
 - Respond ONLY with a JSON object in this exact format (no markdown, no explanation):
-{"marks": <integer>, "is_correct": <boolean>}`;
+{"marks": <integer>, "is_correct": <boolean>}`
 
-  const result = await model.generateContent(prompt);
-  const text = result.response.text().trim();
+  for (const modelName of modelNames) {
+    try {
+      console.log(`Attempting Gemini grading with model: ${modelName}`)
+      const model = genAI.getGenerativeModel({ model: modelName })
+      const result = await model.generateContent(prompt)
+      const text = result.response.text().trim()
 
-  try {
-    const cleaned = text.replace(/```json|```/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    const marks = Math.min(Math.max(Math.round(parsed.marks), 0), maxMarks);
-    return { marks, is_correct: parsed.is_correct === true };
-  } catch {
-    // Fallback: zero marks if Gemini response is unparseable
-    return { marks: 0, is_correct: false };
+      console.log(`Gemini (${modelName}) raw response:`, text)
+
+      const cleaned = text.replace(/```json|```/g, "").trim()
+      const parsed = JSON.parse(cleaned)
+      const marks = Math.min(Math.max(Math.round(parsed.marks), 0), maxMarks)
+      return { marks, is_correct: parsed.is_correct === true }
+    } catch (err) {
+      console.error(`Model ${modelName} failed:`, err instanceof Error ? err.message : String(err))
+      // Continue to next model
+      continue
+    }
   }
+
+  // All models failed
+  console.error('All Gemini model attempts failed. Check GEMINI_API_KEY and model availability.')
+  return { marks: 0, is_correct: false }
 }
 
 export async function POST(req: NextRequest) {
@@ -83,6 +97,8 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { session_id } = body;
 
+    console.log('grade-answers — session_id:', session_id, 'user:', user.id);
+
     if (!session_id) {
       return NextResponse.json(
         { error: "session_id is required" },
@@ -90,23 +106,30 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Fetch the exam session
-    const { data: sessionData, error: sessionError } = await supabase.rpc(
-      "get_exam_session_for_grading",
-      { session_id_param: session_id, user_id_param: user.id }
+    // Fetch session using get_student_sessions
+    const { data: allSessions, error: sessionError } = await supabase.rpc(
+      'get_student_sessions',
+      { student_id_param: user.id }
     );
 
-    if (sessionError || !sessionData) {
+    console.log('allSessions count:', allSessions?.length, 'error:', sessionError);
+
+    if (sessionError) {
+      return NextResponse.json(
+        { error: 'Failed to fetch sessions' },
+        { status: 500 }
+      );
+    }
+
+    const session = (allSessions ?? []).find((s: any) => s.id === session_id);
+
+    console.log('found session:', session?.id ?? 'NOT FOUND');
+
+    if (!session) {
       return NextResponse.json(
         { error: "Session not found or access denied" },
         { status: 404 }
       );
-    }
-
-    const session = Array.isArray(sessionData) ? sessionData[0] : sessionData;
-
-    if (!session) {
-      return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
 
     // Fetch exam questions
@@ -115,6 +138,8 @@ export async function POST(req: NextRequest) {
       { exam_id_param: session.exam_id }
     );
 
+    console.log('questions fetched:', questions?.length, 'error:', questionsError);
+
     if (questionsError || !questions) {
       return NextResponse.json(
         { error: "Failed to fetch questions" },
@@ -122,39 +147,33 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Fetch exam settings (for allow_spelling_mistakes)
+    // Fetch exam settings for allow_spelling_mistakes
     const { data: examData, error: examError } = await supabase.rpc(
       "get_exam_by_id",
       { exam_id_param: session.exam_id }
     );
 
-    if (examError || !examData) {
-      return NextResponse.json(
-        { error: "Failed to fetch exam" },
-        { status: 500 }
-      );
-    }
-
     const exam = Array.isArray(examData) ? examData[0] : examData;
     const allowSpellingMistakes = exam?.allow_spelling_mistakes ?? false;
 
+    console.log('allowSpellingMistakes:', allowSpellingMistakes);
+
     const studentAnswers: Record<string, string> = session.answers || {};
-    const existingGradingDetails: GradingDetails =
-      session.grading_details || {};
+    const existingGradingDetails: GradingDetails = session.grading_details || {};
 
     let totalScore = 0;
     let maxScore = 0;
     const updatedGradingDetails: GradingDetails = {};
 
-    // Grade each question
     for (const question of questions) {
       const qId = question.id;
       const studentAnswer = studentAnswers[qId] ?? null;
       const maxMarks = question.marks || 1;
       maxScore += maxMarks;
 
+      console.log(`Processing Q ${qId} type=${question.type} answer="${studentAnswer}" correct="${question.correct_answer}"`);
+
       if (question.type === "mcq") {
-        // MCQ: exact match on value
         const isCorrect =
           studentAnswer !== null &&
           studentAnswer.trim().toLowerCase() ===
@@ -173,7 +192,7 @@ export async function POST(req: NextRequest) {
           type: "mcq",
         };
       } else {
-        // short_answer or long_answer: use Gemini if answer exists
+        // short_answer or long_answer
         if (!studentAnswer || studentAnswer.trim() === "") {
           totalScore += 0;
           updatedGradingDetails[qId] = {
@@ -186,13 +205,19 @@ export async function POST(req: NextRequest) {
             type: question.type,
           };
         } else {
-          // Check if already graded and doesn't need re-grading
+          // Check if already graded
           const existing = existingGradingDetails[qId];
-          if (existing && !existing.needs_grading && existing.marks_awarded !== null) {
+          if (
+            existing &&
+            !existing.needs_grading &&
+            existing.marks_awarded !== null
+          ) {
+            console.log(`Q ${qId} already graded, skipping`);
             totalScore += existing.marks_awarded;
             updatedGradingDetails[qId] = existing;
           } else {
             // Grade with Gemini
+            console.log(`Sending Q ${qId} to Gemini...`);
             const { marks, is_correct } = await gradeSubjectiveAnswer({
               questionText: question.question_text,
               studentAnswer: studentAnswer,
@@ -201,6 +226,8 @@ export async function POST(req: NextRequest) {
               gradingHint: question.grading_hint,
               allowSpellingMistakes,
             });
+
+            console.log(`Gemini result for Q ${qId}: marks=${marks} is_correct=${is_correct}`);
 
             totalScore += marks;
             updatedGradingDetails[qId] = {
@@ -217,7 +244,10 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Persist graded results back to the session
+    console.log('final totalScore:', totalScore, '/', maxScore);
+    console.log('updatedGradingDetails:', JSON.stringify(updatedGradingDetails));
+
+    // Save results
     const { error: submitError } = await supabase.rpc("submit_exam_session", {
       session_id_param: session_id,
       answers_param: studentAnswers,
@@ -225,6 +255,8 @@ export async function POST(req: NextRequest) {
       max_score_param: maxScore,
       grading_details_param: updatedGradingDetails,
     });
+
+    console.log('submitError:', submitError);
 
     if (submitError) {
       return NextResponse.json(

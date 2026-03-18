@@ -6,30 +6,36 @@ export async function POST(request: Request) {
     const { data: { user } } = await supabase.auth.getUser()
     if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 })
 
-    const { 
+    const {
       session_id, student_id, exam_id,
-      event_type, confidence, metadata, severity 
+      event_type, confidence, metadata, severity
     } = await request.json()
 
-    await supabase.from('behavior_logs').insert({
-      session_id,
-      student_id,
-      exam_id,
-      event_type,
-      confidence,
-      metadata,
-      created_at: new Date().toISOString()
+    console.log('flag-event:', event_type, 'session:', session_id)
+
+    // Insert behavior log via RPC
+    const { error: logError } = await supabase.rpc('insert_behavior_log', {
+      session_id_param: session_id,
+      student_id_param: student_id,
+      exam_id_param: exam_id,
+      event_type_param: event_type,
+      confidence_param: confidence,
+      metadata_param: metadata ?? {},
     })
 
-    await supabase.from('flags').insert({
-      session_id,
-      student_id,
-      exam_id,
-      flag_type: event_type,
-      severity: severity ?? 'medium',
-      metadata,
-      created_at: new Date().toISOString()
+    console.log('behavior log error:', logError)
+
+    // Insert flag via RPC
+    const { error: flagError } = await supabase.rpc('insert_flag', {
+      session_id_param: session_id,
+      student_id_param: student_id,
+      exam_id_param: exam_id,
+      flag_type_param: event_type,
+      severity_param: severity ?? 'medium',
+      metadata_param: metadata ?? {},
     })
+
+    console.log('flag error:', flagError)
 
     return Response.json({ success: true })
   } catch (err) {
