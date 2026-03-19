@@ -13,25 +13,43 @@ interface Invite {
   used: boolean;
 }
 
+interface Profile {
+  id: string;
+  name: string;
+  email: string;
+  avatar_url: string | null;
+}
+
 interface ExamSession {
   id: string;
-  student_id: string;
+  student_id: string | null;
   invite_id: string;
-  started_at: string;
+  started_at: string | null;
   submitted_at: string | null;
   status: string;
   score: number | null;
   max_score: number | null;
   cheating_score: number | null;
+  answers: Record<string, unknown> | null;
 }
 
 interface Flag {
   id: string;
   session_id: string;
-  student_id: string;
+  student_id: string | null;
   flag_type: string;
   severity: string;
   screenshot_url: string | null;
+  created_at: string;
+}
+
+interface BehaviorLog {
+  id: string;
+  session_id: string;
+  student_id: string | null;
+  event_type: string;
+  confidence: number;
+  metadata: Record<string, unknown> | null;
   created_at: string;
 }
 
@@ -40,29 +58,38 @@ interface ExamMonitorProps {
   initialInvites: Invite[];
   initialSessions: ExamSession[];
   initialFlags: Flag[];
+  initialBehaviorLogs: BehaviorLog[];
+  initialProfiles: Profile[];
+  totalQuestions: number;
 }
 
 export default function ExamMonitor({
   exam,
   initialInvites,
   initialSessions,
+  initialProfiles,
   initialFlags,
+  initialBehaviorLogs,
+  totalQuestions,
 }: ExamMonitorProps) {
-  const [sessions, setSessions] = useState<ExamSession[]>(
-    initialSessions ?? []
-  );
-  const [flags, setFlags] = useState<Flag[]>(
-    initialFlags ?? []
-  );
-  const [invites, setInvites] = useState<Invite[]>(
-    initialInvites ?? []
-  );
+  const [sessions, setSessions] = useState<ExamSession[]>(initialSessions ?? []);
+  const [flags, setFlags] = useState<Flag[]>(initialFlags ?? []);
+  const [behaviorLogs, setBehaviorLogs] = useState<BehaviorLog[]>(initialBehaviorLogs ?? []);
+  const [invites, setInvites] = useState<Invite[]>(initialInvites ?? []);
+  const [profiles, setProfiles] = useState<Profile[]>(initialProfiles ?? []);
+  const [now, setNow] = useState(new Date());
+  const [isLive, setIsLive] = useState(true);
 
-  // Set up Supabase Realtime subscriptions
+  // Update time every second for elapsed time calculation
+  useEffect(() => {
+    const interval = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Set up Supabase Real-time subscriptions
   useEffect(() => {
     const supabase = createSupabaseBrowserClient();
 
-    // Subscribe to exam_sessions changes
     const sessionsChannel = supabase
       .channel(`sessions-${exam.id}`)
       .on(
@@ -74,12 +101,12 @@ export default function ExamMonitor({
           filter: `exam_id=eq.${exam.id}`,
         },
         (payload) => {
+          setIsLive(false);
+          setTimeout(() => setIsLive(true), 2000);
           if (payload.eventType === 'INSERT') {
-            // Add new session to state
             setSessions((prev) => [...prev, payload.new as ExamSession]);
           }
           if (payload.eventType === 'UPDATE') {
-            // Replace matching session in state
             setSessions((prev) =>
               prev.map((session) =>
                 session.id === payload.new.id ? (payload.new as ExamSession) : session
@@ -90,7 +117,6 @@ export default function ExamMonitor({
       )
       .subscribe();
 
-    // Subscribe to flags changes
     const flagsChannel = supabase
       .channel(`flags-${exam.id}`)
       .on(
@@ -102,82 +128,187 @@ export default function ExamMonitor({
           filter: `exam_id=eq.${exam.id}`,
         },
         (payload) => {
-          // Prepend new flag to state
+          setIsLive(false);
+          setTimeout(() => setIsLive(true), 2000);
           setFlags((prev) => [payload.new as Flag, ...prev]);
         }
       )
       .subscribe();
 
-    // Cleanup function
+    const behaviorChannel = supabase
+      .channel(`behavior-${exam.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'behavior_logs',
+          filter: `exam_id=eq.${exam.id}`,
+        },
+        (payload) => {
+          setIsLive(false);
+          setTimeout(() => setIsLive(true), 2000);
+          setBehaviorLogs((prev) => [payload.new as BehaviorLog, ...prev]);
+        }
+      )
+      .subscribe();
+
     return () => {
       supabase.removeAllChannels();
     };
   }, [exam.id]);
 
-  // Calculate stats
-  const inProgressCount = sessions.filter((s) => s.status === 'in_progress').length;
-  const submittedCount = sessions.filter((s) => s.status === 'submitted').length;
+  const getStudentName = (session: ExamSession | undefined, invite: Invite): string => {
+    if (!session) return invite.student_name || invite.student_email;
+    const profile = profiles.find((p) => p.id === session.student_id);
+    return profile?.name || invite.student_name || invite.student_email;
+  };
 
-  // Get status badge color
-  const getStatusColor = (status: string): string => {
-    switch (status.toLowerCase()) {
-      case 'published':
-        return 'bg-green-100 text-green-800';
-      case 'draft':
-        return 'bg-gray-100 text-gray-800';
-      case 'closed':
-        return 'bg-red-100 text-red-800';
-      default:
-        return 'bg-blue-100 text-blue-800';
+  const getAnsweredQuestions = (session: ExamSession | undefined): number => {
+    if (!session || !session.answers) return 0;
+    const answers = session.answers as Record<string, unknown>;
+    return Object.keys(answers).filter((key) => answers[key] !== null && answers[key] !== '').length;
+  };
+
+  const calculateTimeElapsed = (startedAt: string | null): string => {
+    if (!startedAt) return '—';
+    const start = new Date(startedAt);
+    const diff = now.getTime() - start.getTime();
+    const totalSeconds = Math.floor(diff / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
+  };
+
+  const getFlagCount = (sessionId: string): number =>
+    flags.filter((f) => f.session_id === sessionId).length;
+
+  const formatType = (type: string): string =>
+    type.split('_').map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
+
+  const formatTime = (dateString: string): string => {
+    try {
+      return new Date(dateString).toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    } catch {
+      return '—';
     }
   };
+
+  const getSeverityBadgeColor = (severity: string): string => {
+    switch (severity.toLowerCase()) {
+      case 'low':      return 'bg-yellow-100 text-yellow-800';
+      case 'medium':   return 'bg-orange-100 text-orange-800';
+      case 'high':     return 'bg-red-100 text-red-800';
+      case 'critical': return 'bg-purple-100 text-purple-800';
+      default:         return 'bg-gray-100 text-gray-800';
+    }
+  };
+
+  const getBorderColor = (severity: string): string => {
+    switch (severity.toLowerCase()) {
+      case 'low':      return 'border-l-4 border-l-yellow-500';
+      case 'medium':   return 'border-l-4 border-l-orange-500';
+      case 'high':     return 'border-l-4 border-l-red-500';
+      case 'critical': return 'border-l-4 border-l-purple-500';
+      default:         return 'border-l-4 border-l-gray-500';
+    }
+  };
+
+  const getSessionStatusColor = (status: string): string => {
+    switch (status) {
+      case 'in_progress': return 'bg-blue-100 text-blue-800';
+      case 'submitted':   return 'bg-green-100 text-green-800';
+      default:            return 'bg-gray-100 text-gray-800';
+    }
+  };
+
+  const getExamStatusColor = (status: string): string => {
+    switch (status.toLowerCase()) {
+      case 'active': return 'bg-green-100 text-green-800';
+      case 'draft':  return 'bg-gray-100 text-gray-800';
+      case 'ended':  return 'bg-red-100 text-red-800';
+      default:       return 'bg-blue-100 text-blue-800';
+    }
+  };
+
+  const inProgressCount = sessions.filter((s) => s.status === 'in_progress').length;
+  const submittedCount  = sessions.filter((s) => s.status === 'submitted').length;
+  const highRiskCount   = sessions.filter((s) => s.cheating_score != null && s.cheating_score > 0.7).length;
 
   return (
     <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       {/* Header */}
       <div className="mb-8">
-        <Link href="/teacher/home" className="text-indigo-600 hover:text-indigo-700 font-medium mb-4 inline-block">
+        <Link
+          href="/teacher/home"
+          className="text-indigo-600 hover:text-indigo-700 font-medium mb-4 inline-block"
+        >
           ← Back to Dashboard
         </Link>
         <div className="flex items-center justify-between">
-          <h1 className="text-4xl font-bold text-gray-900">{exam.title}</h1>
-          <span className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${getStatusColor(exam.status)}`}>
-            {exam.status.charAt(0).toUpperCase() + exam.status.slice(1)}
-          </span>
+          <div>
+            <h1 className="text-4xl font-bold text-gray-900">{exam.title}</h1>
+            <p className="text-sm text-gray-600 mt-1">
+              Total Questions: <span className="font-semibold">{totalQuestions}</span>
+            </p>
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <div
+                className={`h-3 w-3 rounded-full ${
+                  isLive ? 'bg-green-500 animate-pulse' : 'bg-gray-400'
+                }`}
+              />
+              <span className="text-sm font-medium text-gray-700">
+                {isLive ? 'Live' : 'Updating...'}
+              </span>
+            </div>
+            <span
+              className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${getExamStatusColor(exam.status)}`}
+            >
+              {exam.status.charAt(0).toUpperCase() + exam.status.slice(1)}
+            </span>
+          </div>
         </div>
       </div>
 
       {/* Summary Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-        {/* Total Invited */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
         <Card className="p-6 border border-gray-200">
           <div className="space-y-2">
             <p className="text-sm font-medium text-gray-600">Total Invited</p>
             <p className="text-3xl font-bold text-gray-900">{invites.length}</p>
           </div>
         </Card>
-
-        {/* In Progress */}
         <Card className="p-6 border border-gray-200">
           <div className="space-y-2">
             <p className="text-sm font-medium text-gray-600">In Progress</p>
             <p className="text-3xl font-bold text-blue-600">{inProgressCount}</p>
           </div>
         </Card>
-
-        {/* Submitted */}
         <Card className="p-6 border border-gray-200">
           <div className="space-y-2">
             <p className="text-sm font-medium text-gray-600">Submitted</p>
             <p className="text-3xl font-bold text-green-600">{submittedCount}</p>
           </div>
         </Card>
-
-        {/* Total Flags */}
+        <Card className="p-6 border border-gray-200">
+          <div className="space-y-2">
+            <p className="text-sm font-medium text-gray-600">High Risk</p>
+            <p className="text-3xl font-bold text-red-600">{highRiskCount}</p>
+          </div>
+        </Card>
         <Card className="p-6 border border-gray-200">
           <div className="space-y-2">
             <p className="text-sm font-medium text-gray-600">Total Flags</p>
-            <p className="text-3xl font-bold text-red-600">{flags.length}</p>
+            <p className="text-3xl font-bold text-orange-600">{flags.length}</p>
           </div>
         </Card>
       </div>
@@ -201,88 +332,90 @@ export default function ExamMonitor({
                       <tr className="border-b border-gray-200 bg-gray-50">
                         <th className="px-4 py-3 text-left font-semibold text-gray-700">Student</th>
                         <th className="px-4 py-3 text-left font-semibold text-gray-700">Status</th>
+                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Progress</th>
+                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Time</th>
                         <th className="px-4 py-3 text-left font-semibold text-gray-700">Score</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Cheating Score</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Started At</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Submitted At</th>
+                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Risk</th>
+                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Flags</th>
                       </tr>
                     </thead>
                     <tbody>
                       {invites.map((invite) => {
-                        // Find matching session
                         const session = sessions.find((s) => s.invite_id === invite.id);
-
-                        // Derive student row data
                         const status = session?.status || 'not_started';
-                        const score = session?.score;
-                        const maxScore = session?.max_score;
-                        const cheatingScore = session?.cheating_score;
-                        const startedAt = session?.started_at;
-                        const submittedAt = session?.submitted_at;
-
-                        // Get status badge color
-                        const getStatusBadgeColor = (s: string): string => {
-                          switch (s) {
-                            case 'in_progress':
-                              return 'bg-blue-100 text-blue-800';
-                            case 'submitted':
-                              return 'bg-green-100 text-green-800';
-                            case 'not_started':
-                            default:
-                              return 'bg-gray-100 text-gray-800';
-                          }
-                        };
-
-                        // Format date helper
-                        const formatDate = (dateString: string | null | undefined): string => {
-                          if (!dateString) return '—';
-                          const d = new Date(dateString);
-                          return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-                        };
+                        const answeredQuestions = getAnsweredQuestions(session);
+                        const progressPercent =
+                          totalQuestions > 0
+                            ? Math.round((answeredQuestions / totalQuestions) * 100)
+                            : 0;
+                        const flagCount = session ? getFlagCount(session.id) : 0;
 
                         return (
-                          <tr key={invite.id} className="border-b border-gray-100 hover:bg-gray-50 transition-colors">
-                            {/* Student Name + Email */}
+                          <tr
+                            key={invite.id}
+                            className="border-b border-gray-100 hover:bg-gray-50 transition-colors"
+                          >
                             <td className="px-4 py-3">
                               <div className="font-medium text-gray-900">
-                                {invite.student_name || 'Unknown'}
+                                {getStudentName(session, invite)}
                               </div>
                               <div className="text-xs text-gray-500">{invite.student_email}</div>
                             </td>
-
-                            {/* Status Badge */}
                             <td className="px-4 py-3">
-                              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusBadgeColor(status)}`}>
+                              <span
+                                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getSessionStatusColor(status)}`}
+                              >
                                 {status === 'not_started'
                                   ? 'Not Started'
                                   : status.charAt(0).toUpperCase() + status.slice(1).replace('_', ' ')}
                               </span>
                             </td>
-
-                            {/* Score */}
-                            <td className="px-4 py-3 text-gray-700">
-                              {score !== null && maxScore !== null ? `${score}/${maxScore}` : '—'}
+                            <td className="px-4 py-3">
+                              <div className="flex items-center gap-2">
+                                <div className="w-24 bg-gray-200 rounded-full h-2">
+                                  <div
+                                    className="bg-indigo-600 h-2 rounded-full transition-all duration-300"
+                                    style={{ width: `${progressPercent}%` }}
+                                  />
+                                </div>
+                                <span className="text-xs font-medium text-gray-700 whitespace-nowrap">
+                                  {answeredQuestions}/{totalQuestions}
+                                </span>
+                              </div>
                             </td>
-
-                            {/* Cheating Score */}
+                            <td className="px-4 py-3 text-gray-700 font-mono text-xs">
+                              {calculateTimeElapsed(session?.started_at ?? null)}
+                            </td>
                             <td className="px-4 py-3 text-gray-700">
-                              {cheatingScore != null ? (
-                                <span className={cheatingScore > 50 ? 'text-red-600 font-medium' : ''}>
-                                  {typeof cheatingScore === 'number' ? cheatingScore.toFixed(1) + '%' : '—'}
+                              {session?.score != null && session?.max_score != null
+                                ? `${session.score}/${session.max_score}`
+                                : '—'}
+                            </td>
+                            <td className="px-4 py-3">
+                              {session?.cheating_score != null ? (
+                                <span
+                                  className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                                    session.cheating_score > 0.7
+                                      ? 'bg-red-100 text-red-800'
+                                      : session.cheating_score > 0.4
+                                      ? 'bg-yellow-100 text-yellow-800'
+                                      : 'bg-green-100 text-green-800'
+                                  }`}
+                                >
+                                  {(session.cheating_score * 100).toFixed(0)}%
                                 </span>
                               ) : (
-                                '—'
+                                <span className="text-gray-400">—</span>
                               )}
                             </td>
-
-                            {/* Started At */}
-                            <td className="px-4 py-3 text-gray-700 text-xs" suppressHydrationWarning>
-                              {formatDate(startedAt)}
-                            </td>
-
-                            {/* Submitted At */}
-                            <td className="px-4 py-3 text-gray-700 text-xs" suppressHydrationWarning>
-                              {formatDate(submittedAt)}
+                            <td className="px-4 py-3">
+                              {flagCount > 0 ? (
+                                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800">
+                                  {flagCount}
+                                </span>
+                              ) : (
+                                <span className="text-gray-400">—</span>
+                              )}
                             </td>
                           </tr>
                         );
@@ -295,103 +428,48 @@ export default function ExamMonitor({
           </Card>
         </div>
 
-        {/* Right Column: Recent Flags */}
+        {/* Right Column: Activity Feed */}
         <div className="lg:col-span-1">
           <Card className="p-6 border border-gray-200">
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-gray-900">Recent Flags</h2>
-                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800">
-                  {flags.length}
+                <h2 className="text-xl font-bold text-gray-900">Recent Activity</h2>
+                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-orange-100 text-orange-800">
+                  {flags.length + behaviorLogs.length}
                 </span>
               </div>
 
-              {flags.length === 0 ? (
+              {flags.length === 0 && behaviorLogs.length === 0 ? (
                 <div className="flex items-center justify-center py-12">
-                  <p className="text-gray-500 text-center">No flags raised yet</p>
+                  <p className="text-gray-500 text-center">No activity yet</p>
                 </div>
               ) : (
-                <div className="space-y-3 max-h-96 overflow-y-auto">
-                  {flags.slice(0, 20).map((flag) => {
-                    // Find matching session
+                <div className="space-y-3 max-h-[600px] overflow-y-auto">
+                  {flags.slice(0, 15).map((flag) => {
                     const session = sessions.find((s) => s.id === flag.session_id);
-
-                    // Find student name via invite
-                    const studentName =
-                      session && invites.find((inv) => inv.id === session.invite_id)
-                        ? invites.find((inv) => inv.id === session.invite_id)?.student_name
-                        : 'Unknown Student';
-
-                    // Get border color based on severity
-                    const getBorderColor = (severity: string): string => {
-                      switch (severity.toLowerCase()) {
-                        case 'low':
-                          return 'border-l-4 border-l-yellow-500';
-                        case 'medium':
-                          return 'border-l-4 border-l-orange-500';
-                        case 'high':
-                          return 'border-l-4 border-l-red-500';
-                        default:
-                          return 'border-l-4 border-l-gray-500';
-                      }
-                    };
-
-                    // Get severity badge color
-                    const getSeverityBadgeColor = (severity: string): string => {
-                      switch (severity.toLowerCase()) {
-                        case 'low':
-                          return 'bg-yellow-100 text-yellow-800';
-                        case 'medium':
-                          return 'bg-orange-100 text-orange-800';
-                        case 'high':
-                          return 'bg-red-100 text-red-800';
-                        default:
-                          return 'bg-gray-100 text-gray-800';
-                      }
-                    };
-
-                    // Format flag type
-                    const formatFlagType = (type: string): string => {
-                      return type
-                        .split('_')
-                        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-                        .join(' ');
-                    };
-
-                    // Format time
-                    const formatTime = (dateString: string): string => {
-                      try {
-                        return new Date(dateString).toLocaleTimeString();
-                      } catch {
-                        return '—';
-                      }
-                    };
+                    const invite = invites.find((inv) => inv.id === session?.invite_id);
+                    const studentName = getStudentName(session, invite!);
 
                     return (
                       <div
-                        key={flag.id}
+                        key={`flag-${flag.id}`}
                         className={`p-3 bg-gray-50 rounded border ${getBorderColor(flag.severity)}`}
                       >
                         <div className="space-y-2">
-                          {/* Flag Type + Severity Badge */}
                           <div className="flex items-start justify-between gap-2">
                             <div className="font-semibold text-gray-900 text-sm">
-                              {formatFlagType(flag.flag_type)}
+                              🚩 {formatType(flag.flag_type)}
                             </div>
-                            <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium whitespace-nowrap ${getSeverityBadgeColor(flag.severity)}`}>
+                            <span
+                              className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium whitespace-nowrap ${getSeverityBadgeColor(flag.severity)}`}
+                            >
                               {flag.severity.charAt(0).toUpperCase() + flag.severity.slice(1)}
                             </span>
                           </div>
-
-                          {/* Student Name + Time */}
                           <div className="flex items-center justify-between text-xs">
                             <span className="text-gray-600">{studentName}</span>
-                            <span className="text-gray-500" suppressHydrationWarning>
-                              {formatTime(flag.created_at)}
-                            </span>
+                            <span className="text-gray-500">{formatTime(flag.created_at)}</span>
                           </div>
-
-                          {/* Screenshot Thumbnail */}
                           {flag.screenshot_url && (
                             <div className="pt-1">
                               <a
@@ -403,7 +481,7 @@ export default function ExamMonitor({
                                 <img
                                   src={flag.screenshot_url}
                                   alt="Flag screenshot"
-                                  className="h-16 w-16 object-cover rounded border border-gray-300 hover:opacity-80 transition-opacity cursor-pointer"
+                                  className="h-12 w-12 object-cover rounded border border-gray-300 hover:opacity-80 transition-opacity cursor-pointer"
                                 />
                               </a>
                             </div>
@@ -413,10 +491,38 @@ export default function ExamMonitor({
                     );
                   })}
 
-                  {/* Show more indicator */}
-                  {flags.length > 20 && (
+                  {behaviorLogs.slice(0, 15).map((log) => {
+                    const session = sessions.find((s) => s.id === log.session_id);
+                    const invite = invites.find((inv) => inv.id === session?.invite_id);
+                    const studentName = getStudentName(session, invite!);
+
+                    return (
+                      <div
+                        key={`behavior-${log.id}`}
+                        className="p-3 bg-blue-50 rounded border border-l-4 border-l-blue-400"
+                      >
+                        <div className="space-y-2">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="font-semibold text-gray-900 text-sm">
+                              📊 {formatType(log.event_type)}
+                            </div>
+                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 whitespace-nowrap">
+                              {((log.confidence || 0) * 100).toFixed(0)}% conf
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-gray-600">{studentName}</span>
+                            <span className="text-gray-500">{formatTime(log.created_at)}</span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {flags.length + behaviorLogs.length > 15 && (
                     <div className="pt-2 text-center text-xs text-gray-500">
-                      And {flags.length - 20} more flag{flags.length - 20 !== 1 ? 's' : ''}...
+                      And {flags.length + behaviorLogs.length - 15} more event
+                      {flags.length + behaviorLogs.length - 15 !== 1 ? 's' : ''}...
                     </div>
                   )}
                 </div>

@@ -12,6 +12,7 @@ interface GradingDetail {
   marks_awarded: number | null;
   needs_grading: boolean;
   type: string;
+  ai_feedback?: string;
 }
 
 interface GradingDetails {
@@ -23,8 +24,13 @@ interface GradeSubjectiveParams {
   studentAnswer: string;
   correctAnswer: string;
   maxMarks: number;
+  questionType: string;
   gradingHint?: string;
   allowSpellingMistakes?: boolean;
+}
+
+function normalize(s: string): string {
+  return s.toLowerCase().trim().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ');
 }
 
 async function gradeSubjectiveAnswer({
@@ -32,54 +38,130 @@ async function gradeSubjectiveAnswer({
   studentAnswer,
   correctAnswer,
   maxMarks,
+  questionType,
   gradingHint,
   allowSpellingMistakes = false,
-}: GradeSubjectiveParams): Promise<{ marks: number; is_correct: boolean }> {
-  // Try multiple model names in fallback order
-  // Available free-tier models that work with Generative AI API
-  const modelNames = ['gemini-2.5-flash', 'gemini-2.5-flash-exp', 'gemini-2.5-pro']
-
-  const prompt = `You are an exam grader. Grade the student's answer strictly and fairly.
-
-Question: ${questionText}
-Expected Answer / Key Points: ${correctAnswer}
-Student's Answer: ${studentAnswer}
-Maximum Marks: ${maxMarks}
-${gradingHint ? `Grading Hint: ${gradingHint}` : ""}
-${allowSpellingMistakes ? "Note: Minor spelling mistakes should be ignored." : "Note: Spelling is important for this exam."}
-
-Instructions:
-- Award marks from 0 to ${maxMarks} (integers only).
-- Be strict: only award full marks if the answer is complete and correct.
-- Award partial marks proportionally for partially correct answers.
-- A short answer is "correct" if marks awarded >= 50% of max marks.
-- The student's answer does not need to match word-for-word — judge based on meaning and correctness.
-- Respond ONLY with a JSON object in this exact format (no markdown, no explanation):
-{"marks": <integer>, "is_correct": <boolean>}`
-
-  for (const modelName of modelNames) {
-    try {
-      console.log(`Attempting Gemini grading with model: ${modelName}`)
-      const model = genAI.getGenerativeModel({ model: modelName })
-      const result = await model.generateContent(prompt)
-      const text = result.response.text().trim()
-
-      console.log(`Gemini (${modelName}) raw response:`, text)
-
-      const cleaned = text.replace(/```json|```/g, "").trim()
-      const parsed = JSON.parse(cleaned)
-      const marks = Math.min(Math.max(Math.round(parsed.marks), 0), maxMarks)
-      return { marks, is_correct: parsed.is_correct === true }
-    } catch (err) {
-      console.error(`Model ${modelName} failed:`, err instanceof Error ? err.message : String(err))
-      // Continue to next model
-      continue
-    }
+}: GradeSubjectiveParams): Promise<{
+  marks: number;
+  is_correct: boolean;
+  ai_feedback: string;
+}> {
+  // Fast path: exact normalized match always gets full marks
+  if (normalize(studentAnswer) === normalize(correctAnswer)) {
+    return {
+      marks: maxMarks,
+      is_correct: true,
+      ai_feedback: "Exact match — full marks awarded.",
+    };
   }
 
-  // All models failed
-  console.error('All Gemini model attempts failed. Check GEMINI_API_KEY and model availability.')
-  return { marks: 0, is_correct: false }
+  // Use gemini-2.5-flash (stable, confirmed available)
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+  const isLongAnswer = questionType === "long_answer";
+
+  const prompt = `You are a fair and experienced exam grader. Grade the following student answer.
+
+QUESTION: ${questionText}
+CORRECT ANSWER: ${correctAnswer}
+STUDENT ANSWER: ${studentAnswer}
+MAXIMUM MARKS: ${maxMarks}
+QUESTION TYPE: ${questionType}
+ALLOW SPELLING MISTAKES: ${allowSpellingMistakes}
+${gradingHint ? `GRADING HINT: ${gradingHint}` : ""}
+
+GRADING RULES:
+1. Compare meaning, not exact wording. Different phrasing of the same idea = full marks.
+2. Abbreviations equal their full forms: "ANN" = "artificial neural network", "AI" = "artificial intelligence", "UK" = "United Kingdom", "WW2" = "World War 2" = "World War II", etc.
+3. If the student writes the full form and the correct answer has the abbreviation (or vice versa), award full marks.
+4. ${allowSpellingMistakes ? "Spelling mistakes are allowed — ignore ALL spelling errors completely." : "Minor typos are acceptable."}
+5. Extra filler words like 'the full form is', 'it is', 'its', 'I think' do NOT reduce marks.
+6. Missing key facts or clearly wrong information = reduced or zero marks.
+${isLongAnswer
+    ? `7. For long answers, award partial marks proportionally. If the student covers the main concept correctly, award at least 50% marks. Award full marks if all key points are present even if less detailed than the model answer.`
+    : `7. For short answers, award full marks if the core answer is correct regardless of phrasing. Only award 0 if the answer is completely wrong or missing.`
+  }
+
+IMPORTANT: Respond with valid JSON only. No markdown, no backticks, no text outside the JSON object.
+
+Your response must be exactly this shape:
+{
+  "is_correct": true,
+  "marks_awarded": ${maxMarks},
+  "ai_feedback": "One or two sentences explaining the mark given."
+}`;
+
+  try {
+    const result = await model.generateContent(prompt);
+    const rawText = result.response.text().trim();
+
+    console.log(`[Gemini] Raw response:`, rawText);
+
+    // Strip markdown fences if Gemini adds them
+    const cleaned = rawText
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim();
+
+    const parsed = JSON.parse(cleaned);
+
+    console.log('[Gemini] Parsed:', JSON.stringify(parsed));
+
+    // Accept both "marks_awarded" and "marks" field names
+    const rawMarks = parsed.marks_awarded ?? parsed.marks ?? 0;
+    const geminiIsCorrect = parsed.is_correct === true;
+
+    // If Gemini says correct but gave 0 marks — fix it to full marks
+    let finalMarks: number;
+    if (geminiIsCorrect && Number(rawMarks) === 0) {
+      finalMarks = maxMarks;
+    } else {
+      finalMarks = Math.min(Math.max(Math.round(Number(rawMarks)), 0), maxMarks);
+    }
+
+    // Accept multiple possible feedback field names from Gemini
+    const aiFeedback: string =
+      parsed.ai_feedback ||
+      parsed.feedback ||
+      parsed.explanation ||
+      parsed.reason ||
+      (geminiIsCorrect ? "Answer is correct." : "Answer is incorrect.");
+
+    return {
+      marks: finalMarks,
+      is_correct: geminiIsCorrect,
+      ai_feedback: aiFeedback,
+    };
+  } catch (err) {
+    console.error('[Gemini] Failed:', JSON.stringify(err, Object.getOwnPropertyNames(err as object)));
+
+    // Fallback: keyword matching with partial marks
+    const studentNorm = normalize(studentAnswer);
+    const correctNorm = normalize(correctAnswer);
+    const correctWords = correctNorm.split(' ').filter((w) => w.length > 2);
+    const matchCount = correctWords.filter((w) => studentNorm.includes(w)).length;
+    const matchRatio = correctWords.length > 0 ? matchCount / correctWords.length : 0;
+
+    console.log(`[Fallback] matchRatio=${matchRatio}`);
+
+    const isCorrect = matchRatio >= 0.6;
+    const fallbackMarks = isCorrect
+      ? maxMarks
+      : matchRatio >= 0.3
+      ? Math.round(maxMarks * 0.5)
+      : 0;
+
+    return {
+      marks: fallbackMarks,
+      is_correct: isCorrect,
+      ai_feedback: isCorrect
+        ? "Answer accepted based on keyword matching (AI temporarily unavailable)."
+        : matchRatio >= 0.3
+        ? "Partial credit awarded — some key concepts present (AI temporarily unavailable)."
+        : "Answer does not match expected response (AI temporarily unavailable).",
+    };
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -97,69 +179,54 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { session_id } = body;
 
-    console.log('grade-answers — session_id:', session_id, 'user:', user.id);
+    console.log('[grade-answers] session_id:', session_id, 'user:', user.id);
 
     if (!session_id) {
-      return NextResponse.json(
-        { error: "session_id is required" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "session_id is required" }, { status: 400 });
     }
 
-    // Fetch session using get_student_sessions
+    // Fetch session
     const { data: allSessions, error: sessionError } = await supabase.rpc(
       'get_student_sessions',
       { student_id_param: user.id }
     );
 
-    console.log('allSessions count:', allSessions?.length, 'error:', sessionError);
+    console.log('[grade-answers] sessions count:', allSessions?.length, 'error:', sessionError);
 
     if (sessionError) {
-      return NextResponse.json(
-        { error: 'Failed to fetch sessions' },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: 'Failed to fetch sessions' }, { status: 500 });
     }
 
     const session = (allSessions ?? []).find((s: any) => s.id === session_id);
 
-    console.log('found session:', session?.id ?? 'NOT FOUND');
-
     if (!session) {
-      return NextResponse.json(
-        { error: "Session not found or access denied" },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: "Session not found or access denied" }, { status: 404 });
     }
 
-    // Fetch exam questions
+    console.log('[grade-answers] found session:', session.id);
+
+    // Fetch questions
     const { data: questions, error: questionsError } = await supabase.rpc(
       "get_exam_questions",
       { exam_id_param: session.exam_id }
     );
 
-    console.log('questions fetched:', questions?.length, 'error:', questionsError);
+    console.log('[grade-answers] questions fetched:', questions?.length, 'error:', questionsError);
 
     if (questionsError || !questions) {
-      return NextResponse.json(
-        { error: "Failed to fetch questions" },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "Failed to fetch questions" }, { status: 500 });
     }
 
-    // Fetch exam settings for allow_spelling_mistakes
-    const { data: examData, error: examError } = await supabase.rpc(
-      "get_exam_by_id",
-      { exam_id_param: session.exam_id }
-    );
-
+    // Fetch exam settings
+    const { data: examData } = await supabase.rpc("get_exam_by_id", {
+      exam_id_param: session.exam_id,
+    });
     const exam = Array.isArray(examData) ? examData[0] : examData;
     const allowSpellingMistakes = exam?.allow_spelling_mistakes ?? false;
 
-    console.log('allowSpellingMistakes:', allowSpellingMistakes);
+    console.log('[grade-answers] allowSpellingMistakes:', allowSpellingMistakes);
 
     const studentAnswers: Record<string, string> = session.answers || {};
-    const existingGradingDetails: GradingDetails = session.grading_details || {};
 
     let totalScore = 0;
     let maxScore = 0;
@@ -171,9 +238,10 @@ export async function POST(req: NextRequest) {
       const maxMarks = question.marks || 1;
       maxScore += maxMarks;
 
-      console.log(`Processing Q ${qId} type=${question.type} answer="${studentAnswer}" correct="${question.correct_answer}"`);
+      console.log(`[grade-answers] Q ${qId} type=${question.type} answer="${studentAnswer}" correct="${question.correct_answer}"`);
 
       if (question.type === "mcq") {
+        // MCQ: exact match only, no Gemini needed
         const isCorrect =
           studentAnswer !== null &&
           studentAnswer.trim().toLowerCase() ===
@@ -190,11 +258,12 @@ export async function POST(req: NextRequest) {
           marks_awarded: marksAwarded,
           needs_grading: false,
           type: "mcq",
+          ai_feedback: isCorrect ? "Correct answer selected." : "Incorrect answer selected.",
         };
+
       } else {
-        // short_answer or long_answer
+        // short_answer AND long_answer — ALWAYS grade with Gemini, never skip
         if (!studentAnswer || studentAnswer.trim() === "") {
-          totalScore += 0;
           updatedGradingDetails[qId] = {
             question_text: question.question_text,
             student_answer: studentAnswer,
@@ -203,49 +272,39 @@ export async function POST(req: NextRequest) {
             marks_awarded: 0,
             needs_grading: false,
             type: question.type,
+            ai_feedback: "No answer was provided.",
           };
         } else {
-          // Check if already graded
-          const existing = existingGradingDetails[qId];
-          if (
-            existing &&
-            !existing.needs_grading &&
-            existing.marks_awarded !== null
-          ) {
-            console.log(`Q ${qId} already graded, skipping`);
-            totalScore += existing.marks_awarded;
-            updatedGradingDetails[qId] = existing;
-          } else {
-            // Grade with Gemini
-            console.log(`Sending Q ${qId} to Gemini...`);
-            const { marks, is_correct } = await gradeSubjectiveAnswer({
-              questionText: question.question_text,
-              studentAnswer: studentAnswer,
-              correctAnswer: question.correct_answer,
-              maxMarks: maxMarks,
-              gradingHint: question.grading_hint,
-              allowSpellingMistakes,
-            });
+          console.log(`[grade-answers] Sending Q ${qId} (${question.type}) to Gemini...`);
 
-            console.log(`Gemini result for Q ${qId}: marks=${marks} is_correct=${is_correct}`);
+          const { marks, is_correct, ai_feedback } = await gradeSubjectiveAnswer({
+            questionText: question.question_text,
+            studentAnswer: studentAnswer.trim(),
+            correctAnswer: question.correct_answer,
+            maxMarks,
+            questionType: question.type,
+            gradingHint: question.grading_hint,
+            allowSpellingMistakes,
+          });
 
-            totalScore += marks;
-            updatedGradingDetails[qId] = {
-              question_text: question.question_text,
-              student_answer: studentAnswer,
-              correct_answer: question.correct_answer,
-              is_correct,
-              marks_awarded: marks,
-              needs_grading: false,
-              type: question.type,
-            };
-          }
+          console.log(`[grade-answers] Result Q ${qId}: marks=${marks}/${maxMarks} is_correct=${is_correct} feedback="${ai_feedback}"`);
+
+          totalScore += marks;
+          updatedGradingDetails[qId] = {
+            question_text: question.question_text,
+            student_answer: studentAnswer,
+            correct_answer: question.correct_answer,
+            is_correct,
+            marks_awarded: marks,
+            needs_grading: false,
+            type: question.type,
+            ai_feedback,
+          };
         }
       }
     }
 
-    console.log('final totalScore:', totalScore, '/', maxScore);
-    console.log('updatedGradingDetails:', JSON.stringify(updatedGradingDetails));
+    console.log('[grade-answers] final totalScore:', totalScore, '/', maxScore);
 
     // Save results
     const { error: submitError } = await supabase.rpc("submit_exam_session", {
@@ -256,13 +315,10 @@ export async function POST(req: NextRequest) {
       grading_details_param: updatedGradingDetails,
     });
 
-    console.log('submitError:', submitError);
+    console.log('[grade-answers] submitError:', submitError);
 
     if (submitError) {
-      return NextResponse.json(
-        { error: "Failed to save grading results" },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "Failed to save grading results" }, { status: 500 });
     }
 
     return NextResponse.json({
@@ -272,11 +328,9 @@ export async function POST(req: NextRequest) {
       percentage: maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0,
       grading_details: updatedGradingDetails,
     });
+
   } catch (err) {
-    console.error("grade-answers error:", err);
-    return NextResponse.json(
-      { error: "Internal server error" },
-      { status: 500 }
-    );
+    console.error("[grade-answers] Unexpected error:", err);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }

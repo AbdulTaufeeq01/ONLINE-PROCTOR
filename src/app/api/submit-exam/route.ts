@@ -31,7 +31,7 @@ export async function POST(request: Request) {
 
     for (const question of questions ?? []) {
       max_score += question.marks
-      const studentAnswer = (answers ?? {})[question.id]
+      const studentAnswer = (answers ?? {})[question.id] ?? null
 
       console.log(
         `Q ${question.id}: studentAnswer="${studentAnswer}", ` +
@@ -39,6 +39,7 @@ export async function POST(request: Request) {
       )
 
       if (question.type === 'mcq') {
+        // MCQ: grade immediately with exact match
         const isCorrect =
           studentAnswer != null &&
           studentAnswer.toLowerCase().trim() ===
@@ -48,7 +49,7 @@ export async function POST(request: Request) {
 
         grading_details[question.id] = {
           question_text: question.question_text,
-          student_answer: studentAnswer ?? null,
+          student_answer: studentAnswer,
           correct_answer: question.correct_answer,
           is_correct: isCorrect,
           marks_awarded: isCorrect ? question.marks : 0,
@@ -56,19 +57,17 @@ export async function POST(request: Request) {
           type: question.type,
         }
       } else {
-        const studentAns = (studentAnswer ?? '').toLowerCase().trim()
-        const correctAns = (question.correct_answer ?? '').toLowerCase().trim()
-        const isExactMatch = studentAns.length > 0 && studentAns === correctAns
-
-        if (isExactMatch) score += question.marks
-
+        // short_answer or long_answer:
+        // DO NOT attempt grading here — always defer to /api/grade-answers
+        // which uses Gemini for proper semantic grading.
+        // Set needs_grading: true so the results page triggers grade-answers.
         grading_details[question.id] = {
           question_text: question.question_text,
-          student_answer: studentAnswer ?? null,
+          student_answer: studentAnswer,
           correct_answer: question.correct_answer,
-          is_correct: isExactMatch,
-          marks_awarded: isExactMatch ? question.marks : null,
-          needs_grading: !isExactMatch,
+          is_correct: false,
+          marks_awarded: null,
+          needs_grading: true,  // ← triggers Gemini grading on results page
           type: question.type,
         }
       }

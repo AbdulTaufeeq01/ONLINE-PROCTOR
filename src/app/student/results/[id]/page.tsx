@@ -1,107 +1,6 @@
 import { redirect } from 'next/navigation'
+import { cookies } from 'next/headers'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
-import { GoogleGenerativeAI } from '@google/generative-ai'
-
-// Validate API key on startup
-const apiKey = process.env.GEMINI_API_KEY
-if (!apiKey) {
-  console.error('❌ GEMINI_API_KEY not found in environment variables!')
-} else {
-  console.log('✅ GEMINI_API_KEY loaded:', apiKey.substring(0, 10) + '...')
-}
-
-const genAI = apiKey ? new GoogleGenerativeAI(apiKey) : null
-
-async function gradeSubjectiveAnswer({
-  questionText,
-  studentAnswer,
-  correctAnswer,
-  maxMarks,
-  gradingHint,
-  allowSpellingMistakes = false,
-}: {
-  questionText: string
-  studentAnswer: string
-  correctAnswer: string
-  maxMarks: number
-  gradingHint?: string
-  allowSpellingMistakes?: boolean
-}): Promise<{ marks: number; is_correct: boolean; feedback: string }> {
-  if (!genAI) {
-    console.error('❌ Gemini AI not initialized. GEMINI_API_KEY is missing.')
-    return {
-      marks: 0,
-      is_correct: false,
-      feedback: 'API key not configured. Contact administrator.',
-    }
-  }
-
-  const prompt = `You are an exam grader. Grade the student's answer strictly and fairly.
-
-Question: ${questionText}
-Expected Answer / Key Points: ${correctAnswer}
-Student's Answer: ${studentAnswer}
-Maximum Marks: ${maxMarks}
-${gradingHint ? `Grading Hint: ${gradingHint}` : ''}
-${allowSpellingMistakes ? 'Note: Minor spelling mistakes should be ignored.' : 'Note: Spelling is important for this exam.'}
-
-Instructions:
-- Award marks from 0 to ${maxMarks} (integers only).
-- Be strict: only award full marks if the answer is complete and correct.
-- Award partial marks proportionally for partially correct answers.
-- A short answer is "correct" if marks awarded >= 50% of max marks.
-- The student's answer does not need to match word-for-word — judge based on meaning and correctness.
-- Provide 1-2 sentences of feedback explaining the grading.
-- Respond ONLY with a JSON object in this exact format (no markdown, no explanation):
-{"marks": <integer>, "is_correct": <boolean>, "feedback": "<brief feedback>"}`
-
-  // Try multiple model names in fallback order
-  // Available free-tier models that work with Generative AI API
-  const modelNames = ['gemini-2.5-flash', 'gemini-2.5-flash-exp', 'gemini-2.5-pro']
-  
-  for (const modelName of modelNames) {
-    try {
-      console.log(`🔍 Attempting Gemini grading with model: ${modelName}`)
-      const model = genAI.getGenerativeModel({ model: modelName })
-      console.log('✅ Model instantiated successfully')
-      
-      const result = await model.generateContent(prompt)
-      console.log('✅ API response received')
-      
-      const text = result.response.text().trim()
-      console.log(`✅ Gemini (${modelName}) raw response:`, text)
-
-      const cleaned = text.replace(/```json|```/g, '').trim()
-      const parsed = JSON.parse(cleaned)
-      const marks = Math.min(Math.max(Math.round(parsed.marks), 0), maxMarks)
-      console.log(`✅ Successfully graded with ${modelName}: ${marks} marks`)
-      return {
-        marks,
-        is_correct: parsed.is_correct === true,
-        feedback: parsed.feedback || 'No feedback provided.',
-      }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err)
-      const errorStack = err instanceof Error ? err.stack : ''
-      console.error(`❌ Model ${modelName} failed:`)
-      console.error(`   Error: ${errorMsg}`)
-      console.error(`   Stack: ${errorStack}`)
-      // Continue to next model
-      continue
-    }
-  }
-
-  // All models failed
-  console.error('❌ All Gemini models failed. Possible causes:')
-  console.error('  1. Invalid or missing GEMINI_API_KEY')
-  console.error('  2. API quota exceeded')
-  console.error('  3. Network connectivity issue')
-  return {
-    marks: 0,
-    is_correct: false,
-    feedback: 'Grading service temporarily unavailable. Please contact support.',
-  }
-}
 
 export default async function ResultsPage({
   params
@@ -122,129 +21,55 @@ export default async function ResultsPage({
 
   if (!session) redirect('/student/home')
 
-  // Auto-grade if needed — WAIT for it to complete before rendering
-  const hasUngradedQuestions = Object.values(
-    session.grading_details ?? {}
-  ).some((d: any) => d.needs_grading === true)
-
-  console.log(`📊 Session ${id}: hasUngradedQuestions = ${hasUngradedQuestions}`)
-  console.log('📋 Grading details:', JSON.stringify(session.grading_details ?? {}))
+  // Auto-grade if needed — also re-grades short/long answers missing AI feedback
+  const hasUngradedQuestions =
+    !session.grading_details ||
+    Object.keys(session.grading_details).length === 0 ||
+    Object.values(session.grading_details).some(
+      (d: any) =>
+        d.needs_grading === true ||
+        d.marks_awarded === null ||
+        (
+          (d.type === 'short_answer' || d.type === 'long_answer') &&
+          d.student_answer &&
+          d.student_answer.trim() !== '' &&
+          (
+            !d.ai_feedback ||
+            d.ai_feedback === 'Answer not matching (fallback)' ||
+            d.ai_feedback === 'Answer not matching' ||
+            d.ai_feedback === 'Graded by AI'
+          )
+        )
+    )
 
   if (hasUngradedQuestions) {
-    console.log(`🚀 Starting auto-grading for session ${id}...`)
     try {
-      // Fetch exam questions and settings
-      const { data: questions } = await supabase.rpc('get_exam_questions', {
-        exam_id_param: session.exam_id
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
+
+      // ✅ Next.js 16: cookies() returns a Promise — must be awaited
+      const cookieStore = await cookies()
+      const cookieHeader = cookieStore.toString()
+
+      const gradeRes = await fetch(`${baseUrl}/api/grade-answers`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookieHeader,
+        },
+        body: JSON.stringify({ session_id: id })
       })
+      const gradeData = await gradeRes.json()
+      console.log('grade-answers result:', gradeData)
 
-      const { data: examData } = await supabase.rpc('get_exam_by_id', {
-        exam_id_param: session.exam_id
-      })
-      const exam = Array.isArray(examData) ? examData[0] : examData
-      const allowSpellingMistakes = exam?.allow_spelling_mistakes ?? false
-
-      const studentAnswers = session.answers || {}
-      const existingGradingDetails = session.grading_details || {}
-      let totalScore = 0
-      let maxScore = 0
-      const updatedGradingDetails: Record<string, any> = {}
-
-      // Grade each question
-      for (const question of questions ?? []) {
-        const qId = question.id
-        const studentAnswer = studentAnswers[qId] ?? null
-        const maxMarks = question.marks || 1
-        maxScore += maxMarks
-
-        if (question.type === 'mcq') {
-          // MCQ: already graded in submit-exam, just copy over
-          const isCorrect =
-            studentAnswer !== null &&
-            studentAnswer.trim().toLowerCase() ===
-              question.correct_answer?.trim().toLowerCase()
-          const marksAwarded = isCorrect ? maxMarks : 0
-          totalScore += marksAwarded
-
-          updatedGradingDetails[qId] = {
-            question_text: question.question_text,
-            student_answer: studentAnswer,
-            correct_answer: question.correct_answer,
-            is_correct: isCorrect,
-            marks_awarded: marksAwarded,
-            needs_grading: false,
-            type: 'mcq',
-          }
-        } else {
-          // short_answer or long_answer: check if needs grading
-          const existing = existingGradingDetails[qId]
-          if (existing && !existing.needs_grading && existing.marks_awarded !== null) {
-            // Already graded, keep it
-            totalScore += existing.marks_awarded
-            updatedGradingDetails[qId] = existing
-          } else if (!studentAnswer || studentAnswer.trim() === '') {
-            // No answer provided
-            updatedGradingDetails[qId] = {
-              question_text: question.question_text,
-              student_answer: studentAnswer,
-              correct_answer: question.correct_answer,
-              is_correct: false,
-              marks_awarded: 0,
-              needs_grading: false,
-              type: question.type,
-              ai_feedback: 'No answer provided.',
-            }
-          } else {
-            // Grade with Gemini
-            console.log(`Grading Q ${qId} with Gemini...`)
-            const { marks, is_correct, feedback } = await gradeSubjectiveAnswer({
-              questionText: question.question_text,
-              studentAnswer: studentAnswer,
-              correctAnswer: question.correct_answer,
-              maxMarks: maxMarks,
-              gradingHint: question.grading_hint,
-              allowSpellingMistakes,
-            })
-
-            totalScore += marks
-            updatedGradingDetails[qId] = {
-              question_text: question.question_text,
-              student_answer: studentAnswer,
-              correct_answer: question.correct_answer,
-              is_correct,
-              marks_awarded: marks,
-              needs_grading: false,
-              type: question.type,
-              ai_feedback: feedback,
-            }
-          }
-        }
-      }
-
-      console.log('Server-side grading complete:', { totalScore, maxScore })
-
-      // Save updated grading results
-      const { error: submitError } = await supabase.rpc('submit_exam_session', {
-        session_id_param: id,
-        answers_param: studentAnswers,
-        score_param: totalScore,
-        max_score_param: maxScore,
-        grading_details_param: updatedGradingDetails,
-      })
-
-      if (submitError) {
-        console.error('Failed to save grading results:', submitError)
-      } else {
-        // Re-fetch session to get updated data
-        const { data: updatedSessionData } = await supabase.rpc(
-          'get_student_sessions',
-          { student_id_param: user.id }
-        )
-        const updatedSession = (updatedSessionData ?? []).find(
-          (s: any) => s.id === id
-        )
-        if (updatedSession) session = updatedSession
-      }
+      // Re-fetch session to get updated scores
+      const { data: updatedSessionData } = await supabase.rpc(
+        'get_student_sessions',
+        { student_id_param: user.id }
+      )
+      const updatedSession = (updatedSessionData ?? []).find(
+        (s: any) => s.id === id
+      )
+      if (updatedSession) session = updatedSession
     } catch (err) {
       console.error('Auto-grading failed:', err)
     }
@@ -374,10 +199,9 @@ export default async function ResultsPage({
           </h2>
           <div className="space-y-6">
             {questions.map((question: any, index: number) => {
-              // Use grading_details from DB as source of truth
               const detail = gradingDetails[question.id]
-              const studentAnswer = detail?.student_answer 
-                ?? session.answers?.[question.id] 
+              const studentAnswer = detail?.student_answer
+                ?? session.answers?.[question.id]
                 ?? null
               const marksAwarded = detail?.marks_awarded ?? null
               const isCorrect = detail?.is_correct ?? null
@@ -431,7 +255,7 @@ export default async function ResultsPage({
                         </p>
                       </div>
 
-                      {/* AI Feedback for short/long answers */}
+                      {/* AI Feedback */}
                       {aiFeedback && (
                         <div className="mb-4 bg-blue-50 border border-blue-200 rounded p-3">
                           <p className="text-sm font-semibold text-blue-700 mb-1">
@@ -442,7 +266,7 @@ export default async function ResultsPage({
                       )}
 
                       {/* Pending grading notice */}
-                      {needsGrading && (
+                      {needsGrading === true && marksAwarded === null && (
                         <div className="mb-4 bg-yellow-50 border border-yellow-200 rounded p-3">
                           <p className="text-sm text-yellow-700">
                             ⏳ This answer is pending manual review.
@@ -454,7 +278,7 @@ export default async function ResultsPage({
                     {/* Marks */}
                     <div className="ml-4 text-center min-w-[60px]">
                       <p className="text-sm text-gray-600">Marks</p>
-                      {needsGrading ? (
+                      {needsGrading === true && marksAwarded === null ? (
                         <p className="text-2xl font-bold text-yellow-500">—</p>
                       ) : (
                         <p className={`text-2xl font-bold ${
