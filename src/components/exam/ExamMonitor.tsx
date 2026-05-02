@@ -170,10 +170,14 @@ export default function ExamMonitor({
     return Object.keys(answers).filter((key) => answers[key] !== null && answers[key] !== '').length;
   };
 
-  const calculateTimeElapsed = (startedAt: string | null): string => {
+  const calculateTimeElapsed = (
+    startedAt: string | null,
+    endedAt: string | null = null
+  ): string => {
     if (!startedAt) return '—';
     const start = new Date(startedAt);
-    const diff = now.getTime() - start.getTime();
+    const end = endedAt ? new Date(endedAt) : now;
+    const diff = end.getTime() - start.getTime();
     const totalSeconds = Math.floor(diff / 1000);
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
@@ -349,6 +353,12 @@ export default function ExamMonitor({
                             ? Math.round((answeredQuestions / totalQuestions) * 100)
                             : 0;
                         const flagCount = session ? getFlagCount(session.id) : 0;
+                        const cheatingScoreValue =
+                          typeof session?.cheating_score === 'number'
+                            ? (session.cheating_score <= 1
+                                ? session.cheating_score * 100
+                                : session.cheating_score)
+                            : null;
 
                         return (
                           <tr
@@ -384,7 +394,10 @@ export default function ExamMonitor({
                               </div>
                             </td>
                             <td className="px-4 py-3 text-gray-700 font-mono text-xs">
-                              {calculateTimeElapsed(session?.started_at ?? null)}
+                              {calculateTimeElapsed(
+                                session?.started_at ?? null,
+                                session?.submitted_at ?? null
+                              )}
                             </td>
                             <td className="px-4 py-3 text-gray-700">
                               {session?.score != null && session?.max_score != null
@@ -392,17 +405,17 @@ export default function ExamMonitor({
                                 : '—'}
                             </td>
                             <td className="px-4 py-3">
-                              {session?.cheating_score != null ? (
+                              {cheatingScoreValue != null ? (
                                 <span
                                   className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
-                                    session.cheating_score > 0.7
+                                    cheatingScoreValue > 70
                                       ? 'bg-red-100 text-red-800'
-                                      : session.cheating_score > 0.4
+                                      : cheatingScoreValue > 40
                                       ? 'bg-yellow-100 text-yellow-800'
                                       : 'bg-green-100 text-green-800'
                                   }`}
                                 >
-                                  {(session.cheating_score * 100).toFixed(0)}%
+                                  {cheatingScoreValue.toFixed(0)}%
                                 </span>
                               ) : (
                                 <span className="text-gray-400">—</span>

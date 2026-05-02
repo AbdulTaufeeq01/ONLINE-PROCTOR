@@ -78,13 +78,28 @@ Respond in JSON only:
 { "ai_score": number (0-100), "confidence": "low" | "medium" | "high", "explanation": "string" }`;
 
       const content = await model.generateContent(prompt);
-      const responseText = content.response.text();
+      const responseText = content.response.text().trim();
 
-      // Parse JSON response
-      const jsonMatch = responseText.match(/\\{[^}]+\\}/);
-      if (!jsonMatch) throw new Error('Invalid JSON response');
+      // Parse JSON response robustly (Gemini may wrap JSON in ```json fences)
+      const cleaned = responseText
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
 
-      const parsed = JSON.parse(jsonMatch[0]);
+      let parsed: Record<string, any> | null = null;
+      try {
+        parsed = JSON.parse(cleaned);
+      } catch {
+        // Fallback: extract first JSON object-like block
+        const start = cleaned.indexOf('{');
+        const end = cleaned.lastIndexOf('}');
+        if (start === -1 || end === -1 || end <= start) {
+          throw new Error('Invalid JSON response');
+        }
+        parsed = JSON.parse(cleaned.slice(start, end + 1));
+      }
+
       const aiScore = Math.min(100, Math.max(0, parsed.ai_score || 0));
       const isFlagged = aiScore >= threshold;
 

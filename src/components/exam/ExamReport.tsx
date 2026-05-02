@@ -105,11 +105,15 @@ export function ExamReport({
   const sessionsWithCheatingScore = sessions.filter(
     (s) => s.cheating_score !== null
   );
+  const normalizeCheatingScore = (score: number | null): number | null => {
+    if (score == null) return null;
+    return score <= 1 ? score * 100 : score;
+  };
   const averageCheatingScore =
     sessionsWithCheatingScore.length > 0
       ? (
           sessionsWithCheatingScore.reduce(
-            (sum, s) => sum + (s.cheating_score || 0),
+            (sum, s) => sum + (normalizeCheatingScore(s.cheating_score) || 0),
             0
           ) / sessionsWithCheatingScore.length
         ).toFixed(2)
@@ -272,6 +276,7 @@ export function ExamReport({
                         const score = session?.score;
                         const maxScore = session?.max_score;
                         const cheatingScore = session?.cheating_score;
+                        const cheatingScoreValue = normalizeCheatingScore(cheatingScore);
                         const passed =
                           score !== null &&
                           score !== undefined &&
@@ -339,15 +344,17 @@ export function ExamReport({
 
                             {/* Cheating Score */}
                             <td className="px-4 py-3">
-                              {typeof cheatingScore === 'number' ? (
+                              {typeof cheatingScoreValue === 'number' ? (
                                 <p
                                   className={`text-sm font-semibold ${
-                                    cheatingScore > 50
+                                    cheatingScoreValue > 70
                                       ? 'text-red-600'
+                                      : cheatingScoreValue > 40
+                                      ? 'text-yellow-600'
                                       : 'text-gray-900'
                                   }`}
                                 >
-                                  {cheatingScore.toFixed(1)}%
+                                  {cheatingScoreValue.toFixed(0)}%
                                 </p>
                               ) : (
                                 <p className="text-sm text-gray-500">—</p>
@@ -488,24 +495,29 @@ export function ExamReport({
                       )}
 
                     {/* Cheating Score */}
-                    {typeof selectedSession.cheating_score ===
+                    {typeof normalizeCheatingScore(selectedSession.cheating_score) ===
                       'number' && (
                       <div>
                         <p className="text-xs font-medium uppercase text-gray-600">
                           Cheating Score
                         </p>
+                        {(() => {
+                          const scoreValue = normalizeCheatingScore(selectedSession.cheating_score)!
+                          return (
                         <p
                           className={`text-sm font-semibold ${
-                            selectedSession.cheating_score > 50
+                            scoreValue > 70
                               ? 'text-red-600'
+                              : scoreValue > 40
+                                ? 'text-yellow-600'
                               : 'text-gray-900'
                           }`}
                         >
-                          {selectedSession.cheating_score.toFixed(
-                            1
-                          )}
+                          {scoreValue.toFixed(0)}
                           %
                         </p>
+                          )
+                        })()}
                       </div>
                     )}
                   </div>

@@ -23,7 +23,7 @@ export default async function StudentExamPage({ params }: Props) {
   // ── Fetch exam directly (no RPC) ──────────────────────────────────────────
   const { data: exam, error: examError } = await (supabase.from('exams') as any)
     .select(
-      'id, title, duration_minutes, webcam_required, fullscreen_required, shuffle_questions, status'
+      'id, title, duration_minutes, webcam_required, fullscreen_required, shuffle_questions, status, eye_tracking_enabled, phone_detection_enabled, ai_detection_enabled, max_tab_switches'
     )
     .eq('id', id)
     .single() as { data: Exam | null; error: any };

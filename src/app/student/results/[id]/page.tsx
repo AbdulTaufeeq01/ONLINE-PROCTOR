@@ -93,6 +93,37 @@ export default async function ResultsPage({
     .eq('session_id', id)
     .order('created_at', { ascending: false })
 
+  const { data: behaviorLogs } = await (supabase.from('behavior_logs') as any)
+    .select('id, event_type, confidence, created_at, metadata')
+    .eq('session_id', id)
+    .order('created_at', { ascending: false })
+
+  // If behavior exists but score is still zero/null, force a synchronous
+  // analyze-behavior run so the user sees the updated risk score immediately.
+  const hasBehavioralEvidence = (flags?.length ?? 0) > 0 || (behaviorLogs?.length ?? 0) > 0
+  if ((session.cheating_score == null || session.cheating_score === 0) && hasBehavioralEvidence) {
+    try {
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
+      await fetch(`${baseUrl}/api/analyze-behavior`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: id }),
+      })
+
+      const { data: rescoredSession } = await (supabase.from('exam_sessions') as any)
+        .select('id, exam_id, student_id, status, answers, started_at, submitted_at, score, max_score, cheating_score, grading_details, ai_report')
+        .eq('id', id)
+        .eq('student_id', user.id)
+        .single() as { data: ExamSession | null; error: any }
+
+      if (rescoredSession) {
+        Object.assign(session, rescoredSession)
+      }
+    } catch (err) {
+      console.error('Analyze-behavior sync trigger failed:', err)
+    }
+  }
+
   // ── Derived values ────────────────────────────────────────────────────────
   const scorePercentage =
     session.max_score > 0
@@ -117,6 +148,65 @@ export default async function ResultsPage({
     const key = flag.flag_type ?? flag.event_type ?? 'unknown'
     flagTypeCounts[key] = (flagTypeCounts[key] ?? 0) + 1
   }
+
+  // Include only behavior-only logs to avoid double-counting events
+  // that already exist in flags (tab_switch, no_face, fullscreen_exit, etc.).
+  const behaviorOnlyEventTypes = new Set([
+    'loud_sound',
+    'voice_detected',
+    'noise_exam_locked',
+    'answer_speed_anomaly',
+  ])
+
+  for (const log of (behaviorLogs ?? []) as any[]) {
+    const key = log.event_type ?? 'unknown'
+    if (behaviorOnlyEventTypes.has(key)) {
+      flagTypeCounts[key] = (flagTypeCounts[key] ?? 0) + 1
+    }
+  }
+
+  // Support both legacy 0-1 scale and current 0-100 scale
+  const cheatingScoreValue =
+    typeof session.cheating_score === 'number'
+      ? (session.cheating_score <= 1 ? session.cheating_score * 100 : session.cheating_score)
+      : 0
+
+  const severityWeights: Record<string, number> = {
+    critical: 25,
+    high: 15,
+    medium: 8,
+    low: 3,
+  }
+
+  const flagSeverityMap: Record<string, string> = {
+    multiple_faces: 'critical',
+    no_face: 'high',
+    copy_paste: 'high',
+    noise_exam_locked: 'high',
+    tab_switch: 'medium',
+    window_blur: 'medium',
+    fullscreen_exit: 'medium',
+    loud_sound: 'medium',
+    voice_detected: 'medium',
+    eye_away: 'low',
+    phone_suspected: 'low',
+    copy_attempt: 'low',
+  }
+
+  const localFlagScore = (flags ?? []).reduce((sum: number, flag: any) => {
+    const severity = flag.severity ?? flagSeverityMap[flag.flag_type] ?? 'low'
+    return sum + (severityWeights[severity] ?? 3)
+  }, 0)
+
+  const localBehaviorScore = (behaviorLogs ?? []).reduce((sum: number, log: any) => {
+    if (log.event_type === 'noise_exam_locked') return sum + 20
+    if (log.event_type === 'answer_speed_anomaly') return sum + 15
+    if (log.event_type === 'loud_sound' || log.event_type === 'voice_detected') return sum + 8
+    return sum
+  }, 0)
+
+  const fallbackCheatingScore = Math.min(100, Math.round(localFlagScore + localBehaviorScore))
+  const displayCheatingScore = cheatingScoreValue > 0 ? cheatingScoreValue : fallbackCheatingScore
 
   const gradingDetails = (session.grading_details as Record<string, any>) ?? {}
 
@@ -300,14 +390,14 @@ export default async function ResultsPage({
               <p className="text-gray-600">Cheating Risk Score</p>
               <p
                 className={`text-3xl font-bold mt-2 ${
-                  (session.cheating_score ?? 0) > 0.7
+                  displayCheatingScore > 70
                     ? 'text-red-600'
-                    : (session.cheating_score ?? 0) > 0.4
+                    : displayCheatingScore > 40
                     ? 'text-yellow-600'
                     : 'text-green-600'
                 }`}
               >
-                {((session.cheating_score ?? 0) * 100).toFixed(0)}%
+                {displayCheatingScore.toFixed(0)}%
               </p>
             </div>
           </div>

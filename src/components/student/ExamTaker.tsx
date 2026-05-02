@@ -65,6 +65,36 @@ function shuffleArray<T>(array: T[]): T[] {
 export function ExamTaker({ exam, session, questions: initialQuestions, invite }: Props) {
   const maxTabSwitches = exam.max_tab_switches ?? 3;
 
+  const getFullscreenElement = () => {
+    if (typeof document === 'undefined') return null;
+    return (
+      document.fullscreenElement ||
+      (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement ||
+      null
+    );
+  };
+
+  const requestFullscreenCrossBrowser = async () => {
+    if (typeof document === 'undefined') return;
+
+    const el = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void>;
+    };
+
+    if (el.requestFullscreen) {
+      await el.requestFullscreen();
+      return;
+    }
+
+    if (el.webkitRequestFullscreen) {
+      await el.webkitRequestFullscreen();
+    }
+  };
+
+  const syncFullscreenState = () => {
+    setIsFullscreenActive(Boolean(getFullscreenElement()));
+  };
+
   const [shuffledQuestions, setShuffledQuestions] = useState<Question[]>(initialQuestions);
   const [answers, setAnswers] = useState<Record<string, string>>(session.answers ?? {});
   const answersRef = useRef<Record<string, string>>(session.answers ?? {});
@@ -92,6 +122,7 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
   const [showWarning, setShowWarning] = useState<string | null>(null);
   // FIX 3: track WHY a warning is showing so we can take action on dismiss
   const [warningType, setWarningType] = useState<'fullscreen_exit' | 'tab_switch' | 'face' | 'other' | null>(null);
+  const [isFullscreenActive, setIsFullscreenActive] = useState(false);
 
   const [examStarted, setExamStarted] = useState(session.status === 'in_progress');
   // FIX 2: ref mirrors examStarted so event listeners never have stale closure values
@@ -111,6 +142,8 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
   const lastEventTime = useRef<Record<string, number>>({});
   const eventCounts = useRef({ tabSwitches: 0, fullscreenExits: 0, faceEvents: 0 });
   const consecutiveMissesRef = useRef(0);
+  const phoneSuspicionStreakRef = useRef(0);
+  const tabHiddenRef = useRef(false);
 
   // FIX 2: store the tab-switch warning message here while tab is hidden,
   // then apply it to state only when the user returns to the tab.
@@ -119,6 +152,23 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
   useEffect(() => {
     answersRef.current = answers;
   }, [answers]);
+
+  useEffect(() => {
+    syncFullscreenState();
+    if (typeof document === 'undefined') return;
+
+    document.addEventListener('fullscreenchange', syncFullscreenState);
+    document.addEventListener('webkitfullscreenchange', syncFullscreenState as EventListener);
+    document.addEventListener('fullscreenerror', syncFullscreenState);
+    document.addEventListener('webkitfullscreenerror', syncFullscreenState as EventListener);
+
+    return () => {
+      document.removeEventListener('fullscreenchange', syncFullscreenState);
+      document.removeEventListener('webkitfullscreenchange', syncFullscreenState as EventListener);
+      document.removeEventListener('fullscreenerror', syncFullscreenState);
+      document.removeEventListener('webkitfullscreenerror', syncFullscreenState as EventListener);
+    };
+  }, []);
 
   useEffect(() => {
     setShuffledQuestions(
@@ -153,9 +203,8 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
       const supabase = createSupabaseBrowserClient();
       const now = new Date().toISOString();
 
-      const { error } = await supabase
-        .from('exam_sessions')
-        .update({ status: 'in_progress', started_at: now } as Record<string, any>)
+      const { error } = await (supabase.from('exam_sessions') as any)
+        .update({ status: 'in_progress', started_at: now })
         .eq('id', session.id);
 
       if (error) {
@@ -171,7 +220,8 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
       if (exam.fullscreen_required) {
         try {
           console.log('[proctoring] 📲 Requesting initial fullscreen...');
-          await document.documentElement.requestFullscreen();
+          await requestFullscreenCrossBrowser();
+          syncFullscreenState();
           console.log('[proctoring] ✅ Initial fullscreen granted');
         } catch (err) {
           console.warn('[proctoring] ⚠️ Initial fullscreen request denied:', err);
@@ -241,20 +291,34 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
 
       console.log(`[proctoring] 📤 Sending ${event_type} event to /api/flag-event (confidence: ${confidence})`, metadata);
 
+      const payload = JSON.stringify({
+        session_id: session.id,
+        student_id: session.student_id,
+        exam_id:    exam.id,
+        event_type,
+        confidence,
+        metadata,
+        severity:
+          confidence > 0.9 ? 'high' : confidence > 0.7 ? 'medium' : 'low',
+      });
+
       try {
+        const body = new Blob([payload], { type: 'application/json' });
+        const canBeacon = typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function';
+
+        if (canBeacon) {
+          const beaconSent = navigator.sendBeacon('/api/flag-event', body);
+          if (beaconSent) {
+            console.log(`[proctoring] ✅ ${event_type} queued via sendBeacon (confidence: ${confidence})`);
+            return;
+          }
+        }
+
         const response = await fetch('/api/flag-event', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            session_id: session.id,
-            student_id: session.student_id,
-            exam_id:    exam.id,
-            event_type,
-            confidence,
-            metadata,
-            severity:
-              confidence > 0.9 ? 'high' : confidence > 0.7 ? 'medium' : 'low',
-          }),
+          body: payload,
+          keepalive: true,
         });
 
         const data = await response.json();
@@ -489,12 +553,24 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
           const dx        = Math.abs(chin.x - noseTip.x);
           const dy        = Math.abs(chin.y - noseTip.y);
           const tiltAngle = Math.atan2(dx, dy) * (180 / Math.PI);
-          if (tiltAngle > 25) {
+
+          // Reduce false positives: require sustained tilt before flagging.
+          if (tiltAngle > 35) {
+            phoneSuspicionStreakRef.current += 1;
+          } else {
+            phoneSuspicionStreakRef.current = 0;
+          }
+
+          if (phoneSuspicionStreakRef.current >= 5) {
             logBehaviorEvent(
               'phone_suspected',
               Math.min(0.95, 0.5 + tiltAngle / 100),
-              { tiltAngle: Math.round(tiltAngle) }
+              {
+                tiltAngle: Math.round(tiltAngle),
+                sustained_frames: phoneSuspicionStreakRef.current,
+              }
             );
+            phoneSuspicionStreakRef.current = 0;
           }
         }
       } catch (error) {
@@ -526,10 +602,30 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
   // Also removed `examStarted` from deps (stale-closure risk) and replaced
   // it with examStartedRef so the listener never needs to be re-registered.
   useEffect(() => {
+    const registerTabSwitchEvent = (source: 'visibility' | 'blur') => {
+      if (!examStartedRef.current) return;
+
+      // Count each transition to hidden only once until the page becomes visible again.
+      if (tabHiddenRef.current) return;
+      tabHiddenRef.current = true;
+
+      tabSwitchCountRef.current += 1;
+      const newCount = tabSwitchCountRef.current;
+      setTabSwitchCount(newCount);
+      console.log(`[proctoring] ⚠️ TAB SWITCH DETECTED via ${source}! Count: ${newCount}/${maxTabSwitches}`);
+      logBehaviorEvent('tab_switch', 0.95, { count: newCount, source });
+
+      pendingTabWarningRef.current =
+        newCount >= maxTabSwitches
+          ? `⚠️ You have switched tabs ${newCount} times. Your exam may be auto-submitted!`
+          : `⚠️ Tab switch detected! (${newCount}/${maxTabSwitches} allowed). Stay on this page.`;
+    };
+
     const handleVisibilityChange = () => {
       if (!document.hidden) {
         // ── Tab is now visible again ──────────────────────────────────────
         console.log('[proctoring] 👁️ Tab returned to focus');
+        tabHiddenRef.current = false;
         // Apply any warning that was queued while the tab was hidden.
         if (pendingTabWarningRef.current) {
           setWarningType('tab_switch');
@@ -540,25 +636,30 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
       }
 
       // ── Tab just went hidden ──────────────────────────────────────────────
-      // Only flag after the exam has actually started.
-      if (!examStartedRef.current) return;
+      registerTabSwitchEvent('visibility');
+    };
 
-      tabSwitchCountRef.current += 1;
-      const newCount = tabSwitchCountRef.current;
-      setTabSwitchCount(newCount);
-      console.log(`[proctoring] ⚠️ TAB SWITCH DETECTED! Count: ${newCount}/${maxTabSwitches}`);
-      logBehaviorEvent('tab_switch', 0.95, { count: newCount });
+    const handleWindowBlur = () => {
+      registerTabSwitchEvent('blur');
+    };
 
-      // Store the message in a ref — do NOT call setShowWarning here because
-      // the page is hidden and the render will be skipped/deferred.
-      pendingTabWarningRef.current =
-        newCount >= maxTabSwitches
-          ? `⚠️ You have switched tabs ${newCount} times. Your exam may be auto-submitted!`
-          : `⚠️ Tab switch detected! (${newCount}/${maxTabSwitches} allowed). Stay on this page.`;
+    const handleWindowFocus = () => {
+      tabHiddenRef.current = false;
+      if (pendingTabWarningRef.current) {
+        setWarningType('tab_switch');
+        setShowWarning(pendingTabWarningRef.current);
+        pendingTabWarningRef.current = null;
+      }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('focus', handleWindowFocus);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('blur', handleWindowBlur);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
     // examStarted intentionally omitted — we use examStartedRef to avoid
     // re-registering the listener on every exam-start state change.
   }, [logBehaviorEvent, maxTabSwitches]);
@@ -580,9 +681,8 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
 
     const handleFullscreenChange = () => {
       // Check for fullscreen in cross-browser way (both standard and webkit)
-      const isFullscreen = document.fullscreenElement || 
-                          (document as Document & { webkitFullscreenElement?: Element })
-                            .webkitFullscreenElement;
+      const isFullscreen = Boolean(getFullscreenElement());
+      setIsFullscreenActive(isFullscreen);
       
       if (!isFullscreen) {
         console.log('[proctoring] ❌ FULLSCREEN EXITED - Flagging violation');
@@ -614,20 +714,15 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
       // This is called from a click handler → valid user gesture → fullscreen works
       // FIX 4: Try both standard and webkit methods for cross-browser support
       console.log('[proctoring] 📲 Requesting fullscreen re-entry...');
-      const el = document.documentElement;
-      const requestFS = el.requestFullscreen?.bind(el) || 
-                       (el as HTMLElement & { webkitRequestFullscreen?: () => Promise<void> })
-                         .webkitRequestFullscreen?.bind(el);
-      
-      if (requestFS) {
-        requestFS()
-          .then(() => console.log('[proctoring] ✅ Fullscreen re-entered successfully'))
-          .catch((err) => {
-            console.warn('[proctoring] ❌ Fullscreen re-entry failed:', err);
-          });
-      } else {
-        console.warn('[proctoring] ❌ requestFullscreen not supported');
-      }
+      requestFullscreenCrossBrowser()
+        .then(() => {
+          syncFullscreenState();
+          console.log('[proctoring] ✅ Fullscreen re-entered successfully');
+        })
+        .catch((err) => {
+          console.warn('[proctoring] ❌ Fullscreen re-entry failed:', err);
+          syncFullscreenState();
+        });
     }
     setShowWarning(null);
     setWarningType(null);
@@ -946,16 +1041,16 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
           {/* Fullscreen Status */}
           {exam.fullscreen_required && (
             <div className={`rounded-lg px-3 py-2 border ${
-              document.fullscreenElement || (document as any).webkitFullscreenElement
+              isFullscreenActive
                 ? 'bg-green-900/40 border-green-700'
                 : 'bg-red-900/40 border-red-700'
             }`}>
               <p className={`text-xs font-medium ${
-                document.fullscreenElement || (document as any).webkitFullscreenElement
+                isFullscreenActive
                   ? 'text-green-400'
                   : 'text-red-400'
               }`}>
-                {document.fullscreenElement || (document as any).webkitFullscreenElement
+                {isFullscreenActive
                   ? '✅ Fullscreen active'
                   : '❌ Not in fullscreen'}
               </p>
