@@ -33,8 +33,9 @@ const registerSchema = z
       .string()
       .min(1, 'Please confirm your password'),
     role: z
-      .enum(['teacher', 'student'], {
-        errorMap: () => ({ message: 'Please select a role' }),
+      .enum(['teacher', 'student'])
+      .refine((value) => !!value, {
+        message: 'Please select a role',
       }),
   })
   .refine((data) => data.password === data.confirmPassword, {

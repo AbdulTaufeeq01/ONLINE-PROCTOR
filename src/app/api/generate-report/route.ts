@@ -82,12 +82,12 @@ export async function POST(req: NextRequest) {
     }
 
     // Verify teacher owns this exam
-    const { data: examData, error: examError } = await supabase.rpc(
+    const { data: examData, error: examError } = await (supabase.rpc as any)(
       'get_teacher_exam',
       { exam_id_param: exam_id, teacher_id_param: user.id }
     )
 
-    if (examError || !examData?.length) {
+    if (examError || !(examData as any)?.length) {
       return NextResponse.json(
         { error: 'Exam not found or access denied' },
         { status: 404 }
@@ -97,7 +97,7 @@ export async function POST(req: NextRequest) {
     const exam = examData[0]
 
     // Fetch all submitted sessions for this exam
-    const { data: sessionsRaw, error: sessionsError } = await supabase.rpc(
+    const { data: sessionsRaw, error: sessionsError } = await (supabase.rpc as any)(
       'get_exam_sessions_for_report',
       { exam_id_param: exam_id }
     );
@@ -111,7 +111,7 @@ export async function POST(req: NextRequest) {
 
     for (const session of sessions) {
       // Fetch flags per session
-      const { data: flagsRaw } = await supabase.rpc(
+      const { data: flagsRaw } = await (supabase.rpc as any)(
         'get_exam_flags',
         { session_id_param: session.id }
       )
@@ -133,7 +133,7 @@ export async function POST(req: NextRequest) {
       const flags = Object.values(flagMap)
 
       // Fetch behavior logs per session
-      const { data: behaviorRaw } = await supabase.rpc(
+      const { data: behaviorRaw } = await (supabase.rpc as any)(
         'get_exam_behavior_logs',
         { session_id_param: session.id }
       )
@@ -187,7 +187,7 @@ export async function POST(req: NextRequest) {
 
       // Persist ai_report via RPC
       if (report.ai_insight) {
-        await supabase.rpc('update_session_ai_report', {
+        await (supabase.rpc as any)('update_session_ai_report', {
           session_id_param: session.id,
           ai_report_param: report.ai_insight,
         })

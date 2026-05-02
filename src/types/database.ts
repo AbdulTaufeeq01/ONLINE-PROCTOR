@@ -99,21 +99,33 @@ export interface Database {
     Tables: {
       profiles: {
         Row: Profile;
+        Insert: Omit<Profile, 'created_at'>;
+        Update: Partial<Profile>;
       };
       exams: {
         Row: Exam;
+        Insert: Omit<Exam, 'id' | 'created_at'>;
+        Update: Partial<Exam>;
       };
       questions: {
         Row: Question;
+        Insert: Omit<Question, 'id'>;
+        Update: Partial<Question>;
       };
       exam_invites: {
         Row: ExamInvite;
+        Insert: Omit<ExamInvite, 'id' | 'created_at'>;
+        Update: Partial<ExamInvite>;
       };
       exam_sessions: {
         Row: ExamSession;
+        Insert: Omit<ExamSession, 'id'>;
+        Update: Partial<ExamSession>;
       };
       flags: {
         Row: Flag;
+        Insert: Omit<Flag, 'id' | 'created_at'>;
+        Update: Partial<Flag>;
       };
     };
   };

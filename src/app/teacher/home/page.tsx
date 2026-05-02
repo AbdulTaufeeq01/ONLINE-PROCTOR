@@ -8,6 +8,9 @@ import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import TeacherNavbar from '@/components/layout/TeacherNavbar';
 
+// Force re-fetch on every visit — prevents stale cached data after edits
+export const dynamic = 'force-dynamic';
+
 interface Exam {
   id: string;
   title: string;
@@ -16,6 +19,7 @@ interface Exam {
   status: 'draft' | 'active' | 'ended';
   created_at: string;
   question_count?: number;
+  session_count?: number;
 }
 
 const getStatusBadgeColor = (status: string) => {
@@ -39,26 +43,30 @@ export default async function TeacherHomePage() {
   const supabase = await createSupabaseServerClient();
 
   // Get authenticated user
-  const { data: { user }, error } = await supabase.auth.getUser();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
 
   if (!user) {
     redirect('/auth/login');
   }
 
-  // Fetch exams for the teacher
-  const { data: exams, error: examsError } = 
-    await supabase.rpc('get_teacher_exams_with_counts', {
-      teacher_id_param: user.id
-    })
+  // Fetch exams — p_teacher_id matches the RPC function definition
+  const { data: exams, error: examsError } = await (supabase.rpc as any)(
+    'get_teacher_exams_with_counts',
+    { p_teacher_id: user.id }
+  );
 
-  const examList = exams ?? []
+  if (examsError) {
+    console.error('Error fetching exams:', JSON.stringify(examsError, null, 2));
+  }
+
+  const examList = (exams ?? []) as Exam[];
 
   return (
     <main className="min-h-screen bg-gray-50">
-      {/* Navbar */}
       <TeacherNavbar />
 
-      {/* Main Content */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
         {/* Header */}
         <div className="flex flex-col sm:flex-row items-center justify-between mb-8 gap-4">
@@ -93,7 +101,6 @@ export default async function TeacherHomePage() {
             </div>
           </Card>
         ) : (
-          /* Exams Grid */
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {examList.map((exam) => (
               <Card
@@ -105,20 +112,21 @@ export default async function TeacherHomePage() {
                   <h2 className="text-xl font-bold text-gray-900 flex-1 pr-4">
                     {exam.title}
                   </h2>
-                  <Badge className={`${getStatusBadgeColor(
-                    exam.status
-                  )} font-medium px-3 py-1 text-sm whitespace-nowrap`}>
+                  <Badge
+                    className={`${getStatusBadgeColor(exam.status)} font-medium px-3 py-1 text-sm whitespace-nowrap`}
+                  >
                     {getStatusLabel(exam.status)}
                   </Badge>
                 </div>
 
-                {/* Card Info */}
+                {/* Description */}
                 {exam.description && (
                   <p className="text-gray-600 text-sm mb-4 line-clamp-2">
                     {exam.description}
                   </p>
                 )}
 
+                {/* Stats */}
                 <div className="grid grid-cols-3 gap-4 mb-6 py-4 border-y border-gray-200">
                   <div className="text-center">
                     <p className="text-gray-500 text-xs font-medium uppercase">
@@ -133,7 +141,7 @@ export default async function TeacherHomePage() {
                       Questions
                     </p>
                     <p className="text-lg font-semibold text-gray-900 mt-1">
-                      {exam.question_count || 0}
+                      {exam.question_count ?? 0}
                     </p>
                   </div>
                   <div className="text-center">
@@ -148,14 +156,12 @@ export default async function TeacherHomePage() {
 
                 {/* Action Buttons */}
                 <div className="flex flex-wrap gap-3">
-                  {/* Edit Button - Always visible */}
                   <Link href={`/teacher/exam/${exam.id}/edit`}>
                     <Button className="bg-gray-200 hover:bg-gray-300 text-gray-900 font-medium text-sm px-4 py-2">
                       Edit
                     </Button>
                   </Link>
 
-                  {/* Invite Students - Only for active exams */}
                   {exam.status === 'active' && (
                     <Link href={`/teacher/exam/${exam.id}/invite`}>
                       <Button className="bg-blue-100 hover:bg-blue-200 text-blue-900 font-medium text-sm px-4 py-2">
@@ -164,7 +170,6 @@ export default async function TeacherHomePage() {
                     </Link>
                   )}
 
-                  {/* Monitor - Only for active exams */}
                   {exam.status === 'active' && (
                     <Link href={`/teacher/exam/${exam.id}/monitor`}>
                       <Button className="bg-purple-100 hover:bg-purple-200 text-purple-900 font-medium text-sm px-4 py-2">
@@ -173,7 +178,6 @@ export default async function TeacherHomePage() {
                     </Link>
                   )}
 
-                  {/* Report - Only for ended exams */}
                   {exam.status === 'ended' && (
                     <Link href={`/teacher/exam/${exam.id}/report`}>
                       <Button className="bg-green-100 hover:bg-green-200 text-green-900 font-medium text-sm px-4 py-2">

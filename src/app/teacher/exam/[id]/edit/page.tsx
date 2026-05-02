@@ -47,13 +47,14 @@ export default function ExamEditPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isActivating, setIsActivating] = useState(false);
 
-  // Fetch exam and questions on load
   useEffect(() => {
     const fetchData = async () => {
       try {
         // Get current user
-        const { data: { user: currentUser } } = await supabase.auth.getUser()
-        
+        const {
+          data: { user: currentUser },
+        } = await supabase.auth.getUser();
+
         if (!currentUser) {
           toast.error('Not authenticated');
           router.push('/auth/login');
@@ -62,32 +63,31 @@ export default function ExamEditPage() {
 
         setUserId(currentUser.id);
 
-        // Fetch exam
-        const examCall = supabase.rpc('get_teacher_exam', {
-          exam_id_param: examId,
-          teacher_id_param: currentUser.id
-        } as any) as any
-        const { data: examData } = await examCall
+        // Fetch exam directly from table (avoids RPC parameter name guessing)
+        const { data: examData, error: examError } = await supabase
+          .from('exams')
+          .select('id, title, status, duration_minutes')
+          .eq('id', examId)
+          .eq('teacher_id', currentUser.id)
+          .single();
 
-        const exam = examData?.[0] ?? null
-
-        if (!exam) {
+        if (examError || !examData) {
+          console.error('Error fetching exam:', examError);
           toast.error('Failed to load exam');
           router.push('/teacher/home');
           return;
         }
 
-        setExam(exam);
+        setExam(examData);
 
-        // Fetch questions
-        const questionsCall = supabase
-          .rpc('get_exam_questions', {
-            exam_id_param: examData[0]?.id ?? examId
-          } as any) as any
-        const { data: questionsData, error: questionsError } = await questionsCall
+        // Fetch questions — p_exam_id matches the RPC function definition
+        const { data: questionsData, error: questionsError } = await (supabase.rpc as any)(
+          'get_exam_questions',
+          { p_exam_id: examId }
+        );
 
         if (questionsError) {
-          console.error('Error fetching questions:', questionsError);
+          console.error('Error fetching questions:', JSON.stringify(questionsError, null, 2));
           setQuestions([]);
         } else {
           setQuestions(questionsData || []);
@@ -111,12 +111,12 @@ export default function ExamEditPage() {
 
     setIsActivating(true);
     try {
-      const { error } = await (supabase
-        .from('exams') as any)
+      const { error } = await (supabase.from('exams') as any)
         .update({ status: 'active' })
         .eq('id', examId);
 
       if (error) {
+        console.error('Error activating exam:', error);
         toast.error('Failed to activate exam');
         return;
       }
@@ -160,13 +160,18 @@ export default function ExamEditPage() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Back Link and Header */}
         <div className="mb-8">
-          <Link href="/teacher/home" className="text-indigo-600 hover:text-indigo-700 font-medium mb-4 inline-block">
+          <Link
+            href="/teacher/home"
+            className="text-indigo-600 hover:text-indigo-700 font-medium mb-4 inline-block"
+          >
             ← Back to Dashboard
           </Link>
           <div className="flex justify-between items-center">
             <div>
               <h1 className="text-4xl font-bold text-gray-900">{exam.title}</h1>
-              <p className="text-gray-600 mt-2">Duration: {exam.duration_minutes} minutes</p>
+              <p className="text-gray-600 mt-2">
+                Duration: {exam.duration_minutes} minutes
+              </p>
             </div>
             {exam.status === 'draft' && (
               <Button
@@ -178,15 +183,21 @@ export default function ExamEditPage() {
               </Button>
             )}
             {exam.status !== 'draft' && (
-              <Badge className={exam.status === 'active' ? 'bg-green-200 text-green-800' : 'bg-blue-200 text-blue-800'}>
+              <Badge
+                className={
+                  exam.status === 'active'
+                    ? 'bg-green-200 text-green-800'
+                    : 'bg-blue-200 text-blue-800'
+                }
+              >
                 {exam.status.charAt(0).toUpperCase() + exam.status.slice(1)}
               </Badge>
             )}
           </div>
         </div>
 
-        {/* Two Panel Layout */}
-        <QuestionEditor 
+        {/* Question Editor */}
+        <QuestionEditor
           examId={examId}
           userId={userId}
           initialQuestions={questions}

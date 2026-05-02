@@ -1,5 +1,6 @@
 import { redirect } from 'next/navigation';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
+import { Profile } from '@/types/database';
 import { StudentDashboard } from '@/components/student/StudentDashboard';
 
 export default async function StudentHomePage() {
@@ -18,21 +19,19 @@ export default async function StudentHomePage() {
   console.log('user email:', user.email);
 
   // Fetch user profile and verify role
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
+  const { data: profile, error: profileError } = await (supabase.from('profiles') as any)
     .select('id, name, email, role')
     .eq('id', user.id)
-    .single();
+    .single() as { data: Profile | null; error: any };
 
   if (!profile || profileError || profile.role !== 'student') {
     redirect('/teacher/home');
   }
 
   // Fetch all exam invites for this student
-  const { data: rawInvites, error: invitesError } = await supabase
-    .rpc('get_student_invites', { 
-      student_email_param: user.email 
-    });
+  const { data: rawInvites, error: invitesError } = await (supabase.rpc as any)('get_student_invites', { 
+    student_email_param: user.email 
+  });
 
   console.log('invitesError:', invitesError);
   console.log('rawInvites:', rawInvites);
@@ -40,10 +39,10 @@ export default async function StudentHomePage() {
   const examInvites = rawInvites ?? [];
 
   // Fetch exams for each invite
-  const examIds = examInvites.map((invite) => invite.exam_id);
+  const examIds = examInvites.map((invite: any) => invite.exam_id);
 
   const { data: rawExams, error: examsError } = examIds.length > 0
-    ? await supabase.rpc('get_student_exams', {
+    ? await (supabase.rpc as any)('get_student_exams', {
         exam_ids: examIds
       })
     : { data: [], error: null };
@@ -55,7 +54,7 @@ export default async function StudentHomePage() {
 
   // Fetch exam sessions to know which exams are already attempted
   const { data: rawSessions, error: sessionsError } = 
-    await supabase.rpc('get_student_sessions', {
+    await (supabase.rpc as any)('get_student_sessions', {
       student_id_param: user.id
     });
 
@@ -65,9 +64,9 @@ export default async function StudentHomePage() {
   const examSessions = rawSessions ?? [];
 
   // Combine exam invites with related exams
-  const invitesWithExams = examInvites.map((invite) => ({
+  const invitesWithExams = examInvites.map((invite: any) => ({
     ...invite,
-    exam: exams.find((e) => e.id === invite.exam_id),
+    exam: exams.find((e: any) => e.id === invite.exam_id),
   }));
 
   return (

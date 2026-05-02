@@ -40,23 +40,38 @@ export default async function MonitorPage({
   }
 
   // Step 3: Fetch exam invites
-  const { data: invites = [] } = await supabase
-    .from('exam_invites')
+  const { data: invites = [] } = await (supabase.from('exam_invites') as any)
     .select('*')
     .eq('exam_id', id);
 
   // Step 4: Fetch exam sessions
-  const { data: sessions = [] } = await supabase
-    .from('exam_sessions')
+  const { data: sessions = [] } = await (supabase.from('exam_sessions') as any)
     .select('*')
     .eq('exam_id', id);
 
   // Step 5: Fetch flags ordered by created_at descending
-  const { data: flags = [] } = await supabase
-    .from('flags')
+  const { data: flags = [] } = await (supabase.from('flags') as any)
     .select('*')
     .eq('exam_id', id)
     .order('created_at', { ascending: false });
+
+  // Step 6: Fetch behavior logs
+  const { data: behaviorLogs = [] } = await (supabase.from('behavior_logs') as any)
+    .select('*')
+    .eq('exam_id', id);
+
+  // Step 7: Fetch profiles for the students in sessions
+  const studentIds = sessions.map((s: any) => s.student_id).filter(Boolean);
+  const { data: profiles = [] } = studentIds.length > 0
+    ? await (supabase.from('profiles') as any)
+        .select('*')
+        .in('id', studentIds)
+    : { data: [] };
+
+  // Step 8: Fetch total questions for this exam
+  const { data: questions = [] } = await (supabase.from('questions') as any)
+    .select('id')
+    .eq('exam_id', id);
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -66,6 +81,9 @@ export default async function MonitorPage({
         initialSessions={sessions ?? []}
         initialInvites={invites ?? []}
         initialFlags={flags ?? []}
+        initialBehaviorLogs={behaviorLogs ?? []}
+        initialProfiles={profiles ?? []}
+        totalQuestions={questions?.length ?? 0}
       />
     </div>
   );

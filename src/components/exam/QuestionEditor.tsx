@@ -35,7 +35,7 @@ interface FormData {
   optionB: string;
   optionC: string;
   optionD: string;
-  correctAnswer: string; // stores the LABEL (A/B/C/D) for display, we resolve to value on save
+  correctAnswer: string;
   marks: number;
   grading_hint: string;
 }
@@ -65,22 +65,13 @@ const getTypeColor = (type: string) => {
   }
 };
 
-// Normalize options from DB (could be {label,value}[] or string[])
 function normalizeOptions(options: any): QuestionOption[] | null {
   if (!options) return null;
-  
-  // If it's a string, parse it first
   let parsed = options;
   if (typeof options === 'string') {
-    try {
-      parsed = JSON.parse(options);
-    } catch {
-      return null;
-    }
+    try { parsed = JSON.parse(options); } catch { return null; }
   }
-
   if (!Array.isArray(parsed)) return null;
-
   return parsed.map((o: any) =>
     typeof o === 'object'
       ? { label: o.label ?? '', value: o.value ?? '' }
@@ -95,12 +86,10 @@ export default function QuestionEditor({
   onQuestionsChange,
 }: QuestionEditorProps) {
   const supabase = createSupabaseBrowserClient();
+
   const [questions, setQuestions] = useState<Question[]>(
-  initialQuestions.map((q) => ({
-    ...q,
-    options: normalizeOptions(q.options),
-  }))
-);
+    initialQuestions.map((q) => ({ ...q, options: normalizeOptions(q.options) }))
+  );
   const [selectedQuestionId, setSelectedQuestionId] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -116,7 +105,7 @@ export default function QuestionEditor({
     grading_hint: '',
   });
 
-  // When selecting a question, populate form
+  // Populate form when selecting a question to edit
   useEffect(() => {
     if (!selectedQuestionId) return;
     const question = questions.find((q) => q.id === selectedQuestionId);
@@ -125,10 +114,9 @@ export default function QuestionEditor({
     const normalized = normalizeOptions(question.options);
 
     if (question.type === 'mcq' && normalized) {
-      // Find which label (A/B/C/D) matches the stored correct_answer value
       const correctLabel =
         normalized.find((o) => o.value === question.correct_answer)?.label ??
-        question.correct_answer; // fallback to stored value
+        question.correct_answer;
 
       setFormData({
         type: question.type,
@@ -171,6 +159,26 @@ export default function QuestionEditor({
     setSelectedQuestionId(null);
   };
 
+  // ── Refresh questions list from DB ──────────────────────────────────────────
+  const refreshQuestions = async () => {
+    // Use direct table query — avoids all RPC param name issues
+    const { data, error } = await supabase
+      .from('questions')
+      .select('id, order_index, type, question_text, options, correct_answer, marks, grading_hint')
+      .eq('exam_id', examId)
+      .order('order_index', { ascending: true });
+
+    if (!error && data) {
+      const normalized = data.map((q: any) => ({
+        ...q,
+        options: normalizeOptions(q.options),
+      }));
+      setQuestions(normalized);
+      onQuestionsChange(normalized);
+    }
+  };
+
+  // ── Save (insert or update) ─────────────────────────────────────────────────
   const handleSaveQuestion = async () => {
     if (!formData.question_text.trim()) {
       toast.error('Question text is required');
@@ -185,6 +193,7 @@ export default function QuestionEditor({
 
     setIsSaving(true);
     try {
+      // Build options array for MCQ
       const options =
         formData.type === 'mcq'
           ? [
@@ -195,72 +204,69 @@ export default function QuestionEditor({
             ]
           : null;
 
-      // For MCQ: store the VALUE of the correct option, not the label
-      // e.g. if correct is "A" and optionA is "Delhi", store "Delhi"
+      // For MCQ: store the VALUE of the correct option (e.g. "Delhi"), not the label ("A")
       let correctAnswerToStore = formData.correctAnswer;
       if (formData.type === 'mcq' && options) {
-        const matchedOption = options.find(
-          (o) => o.label === formData.correctAnswer
-        );
-        if (matchedOption) {
-          correctAnswerToStore = matchedOption.value;
-        }
+        const matchedOption = options.find((o) => o.label === formData.correctAnswer);
+        if (matchedOption) correctAnswerToStore = matchedOption.value;
       }
 
       if (selectedQuestionId) {
+        // ── UPDATE existing question — direct table update ──────────────────
         const selectedQuestion = questions.find((q) => q.id === selectedQuestionId);
         if (!selectedQuestion) { toast.error('Question not found'); return; }
 
-        const { error } = await supabase.rpc('update_question', {
-          question_id_param: selectedQuestionId,
-          teacher_id_param: userId,
-          order_index_param: selectedQuestion.order_index,
-          type_param: formData.type,
-          question_text_param: formData.question_text,
-          options_param: options ? JSON.stringify(options) : null,
-          correct_answer_param: correctAnswerToStore,
-          marks_param: formData.marks,
-          grading_hint_param: formData.grading_hint || null,
-        } as any);
+        const { error } = await (supabase.from('questions') as any)
+          .update({
+            type:           formData.type,
+            question_text:  formData.question_text.trim(),
+            options:        options,                    // stored as jsonb
+            correct_answer: correctAnswerToStore,
+            marks:          Number(formData.marks),     // ensure integer
+            grading_hint:   formData.grading_hint.trim() || null,
+            order_index:    selectedQuestion.order_index,
+          })
+          .eq('id', selectedQuestionId)
+          .eq('exam_id', examId);                       // safety check
 
-        if (error) { toast.error('Failed to update question'); return; }
+        if (error) {
+          console.error('Update question error:', error);
+          toast.error('Failed to update question');
+          return;
+        }
         toast.success('Question updated successfully');
+
       } else {
+        // ── INSERT new question — direct table insert ───────────────────────
         const nextOrderIndex =
           questions.length > 0
             ? Math.max(...questions.map((q) => q.order_index)) + 1
             : 1;
 
-        const { error } = await supabase.rpc('save_question', {
-          exam_id_param: examId,
-          teacher_id_param: userId,
-          order_index_param: nextOrderIndex,
-          type_param: formData.type,
-          question_text_param: formData.question_text,
-          options_param: options ? JSON.stringify(options) : null,
-          correct_answer_param: correctAnswerToStore,
-          marks_param: formData.marks,
-          grading_hint_param: formData.grading_hint ?? null,
-        } as any);
+        const { error } = await supabase
+          .from('questions')
+          .insert({
+            exam_id:        examId,
+            order_index:    nextOrderIndex,             // INTEGER — required
+            type:           formData.type,
+            question_text:  formData.question_text.trim(),
+            options:        options,                    // stored as jsonb
+            correct_answer: correctAnswerToStore,
+            marks:          Number(formData.marks),     // ensure integer
+            grading_hint:   formData.grading_hint.trim() || null,
+          } as Record<string, any>);
 
-        if (error) { toast.error('Failed to add question'); return; }
+        if (error) {
+          console.error('Insert question error:', error);
+          toast.error('Failed to add question');
+          return;
+        }
         toast.success('Question added successfully');
       }
 
       resetForm();
+      await refreshQuestions();
 
-      // Refresh questions list
-      const { data: updatedQuestions, error: refreshError } = await supabase
-        .rpc('get_exam_questions', { exam_id_param: examId } as any);
-
-      if (!refreshError && updatedQuestions) {
-        const normalized = updatedQuestions.map((q: any) => ({
-          ...q,
-          options: normalizeOptions(q.options),
-        }));
-        setQuestions(normalized);
-        onQuestionsChange(normalized);
-      }
     } catch (error) {
       console.error('Error saving question:', error);
       toast.error('An unexpected error occurred');
@@ -269,15 +275,21 @@ export default function QuestionEditor({
     }
   };
 
+  // ── Delete question — direct table delete ───────────────────────────────────
   const handleDeleteQuestion = async (questionId: string) => {
     if (!confirm('Are you sure you want to delete this question?')) return;
     try {
-      const { error } = await supabase.rpc('delete_question', {
-        question_id_param: questionId,
-        teacher_id_param: userId,
-      } as any);
+      const { error } = await supabase
+        .from('questions')
+        .delete()
+        .eq('id', questionId)
+        .eq('exam_id', examId);   // safety check — only delete own exam's questions
 
-      if (error) { toast.error('Failed to delete question'); return; }
+      if (error) {
+        console.error('Delete question error:', error);
+        toast.error('Failed to delete question');
+        return;
+      }
 
       const updatedQuestions = questions.filter((q) => q.id !== questionId);
       setQuestions(updatedQuestions);
@@ -417,7 +429,6 @@ export default function QuestionEditor({
                   )
                 )}
 
-                {/* Correct Answer — shows label but saves value */}
                 <div>
                   <Label className="block text-sm font-medium text-gray-700 mb-2">
                     Correct Answer
@@ -429,24 +440,16 @@ export default function QuestionEditor({
                     }
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
                   >
-                    <option value="A">
-                      Option A {formData.optionA ? `— ${formData.optionA}` : ''}
-                    </option>
-                    <option value="B">
-                      Option B {formData.optionB ? `— ${formData.optionB}` : ''}
-                    </option>
-                    <option value="C">
-                      Option C {formData.optionC ? `— ${formData.optionC}` : ''}
-                    </option>
-                    <option value="D">
-                      Option D {formData.optionD ? `— ${formData.optionD}` : ''}
-                    </option>
+                    <option value="A">Option A {formData.optionA ? `— ${formData.optionA}` : ''}</option>
+                    <option value="B">Option B {formData.optionB ? `— ${formData.optionB}` : ''}</option>
+                    <option value="C">Option C {formData.optionC ? `— ${formData.optionC}` : ''}</option>
+                    <option value="D">Option D {formData.optionD ? `— ${formData.optionD}` : ''}</option>
                   </select>
                 </div>
               </div>
             )}
 
-            {/* Short/Long Answer correct answer */}
+            {/* Short/Long Answer */}
             {formData.type !== 'mcq' && (
               <div>
                 <Label className="block text-sm font-medium text-gray-700 mb-2">
@@ -509,11 +512,7 @@ export default function QuestionEditor({
                   : 'Add Question'}
               </Button>
               {selectedQuestionId && (
-                <Button
-                  onClick={resetForm}
-                  variant="outline"
-                  className="flex-1"
-                >
+                <Button onClick={resetForm} variant="outline" className="flex-1">
                   Cancel Edit
                 </Button>
               )}

@@ -35,27 +35,23 @@ export default async function ExamReportPage({ params }: Props) {
   }
 
   // Fetch all questions
-  const { data: questions = [] } = await supabase
-    .from('questions')
+  const { data: questions } = await (supabase.from('questions') as any)
     .select('*')
     .eq('exam_id', id)
     .order('order_index', { ascending: true });
 
   // Fetch all exam sessions
-  const { data: examSessions = [] } = await supabase
-    .from('exam_sessions')
+  const { data: examSessions } = await (supabase.from('exam_sessions') as any)
     .select('*')
     .eq('exam_id', id);
 
   // Fetch all exam invites
-  const { data: examInvites = [] } = await supabase
-    .from('exam_invites')
+  const { data: examInvites } = await (supabase.from('exam_invites') as any)
     .select('*')
     .eq('exam_id', id);
 
   // Fetch all flags
-  const { data: flags = [] } = await supabase
-    .from('flags')
+  const { data: flags } = await (supabase.from('flags') as any)
     .select('*')
     .eq('exam_id', id)
     .order('created_at', { ascending: false });
@@ -65,10 +61,10 @@ export default async function ExamReportPage({ params }: Props) {
       <TeacherNavbar />
       <ExamReport
         exam={exam}
-        questions={questions}
-        initialSessions={examSessions}
-        initialInvites={examInvites}
-        initialFlags={flags}
+        questions={questions || undefined}
+        initialSessions={examSessions || []}
+        initialInvites={examInvites || []}
+        initialFlags={flags || []}
       />
     </div>
   );

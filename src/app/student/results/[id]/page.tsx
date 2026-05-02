@@ -1,90 +1,78 @@
 import { redirect } from 'next/navigation'
-import { cookies } from 'next/headers'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
+import { ExamSession, Exam } from '@/types/database'
+
+export const dynamic = 'force-dynamic'
 
 export default async function ResultsPage({
-  params
+  params,
 }: {
   params: Promise<{ id: string }>
 }) {
   const { id } = await params
   const supabase = await createSupabaseServerClient()
   const { data: { user } } = await supabase.auth.getUser()
-
   if (!user) redirect('/auth/login')
 
-  // Fetch session
-  const { data: sessionData } = await supabase.rpc('get_student_sessions', {
-    student_id_param: user.id
-  })
-  let session = (sessionData ?? []).find((s: any) => s.id === id) ?? null
+  // ── Fetch session directly ────────────────────────────────────────────────
+  const { data: session, error: sessionError } = await (supabase.from('exam_sessions') as any)
+    .select('id, exam_id, student_id, status, answers, started_at, submitted_at, score, max_score, cheating_score, grading_details, ai_report')
+    .eq('id', id)
+    .eq('student_id', user.id)
+    .single() as { data: ExamSession | null; error: any }
 
-  if (!session) redirect('/student/home')
+  if (!session || sessionError) redirect('/student/home')
 
-  // Auto-grade if needed — also re-grades short/long answers missing AI feedback
+  // ── Trigger AI grading if any question still needs it ─────────────────────
   const hasUngradedQuestions =
     !session.grading_details ||
     Object.keys(session.grading_details).length === 0 ||
-    Object.values(session.grading_details).some(
-      (d: any) =>
-        d.needs_grading === true ||
-        d.marks_awarded === null ||
-        (
-          (d.type === 'short_answer' || d.type === 'long_answer') &&
-          d.student_answer &&
-          d.student_answer.trim() !== '' &&
-          (
-            !d.ai_feedback ||
-            d.ai_feedback === 'Answer not matching (fallback)' ||
-            d.ai_feedback === 'Answer not matching' ||
-            d.ai_feedback === 'Graded by AI'
-          )
-        )
+    Object.values(session.grading_details as Record<string, any>).some(
+      (d: any) => d.needs_grading === true || d.marks_awarded === null
     )
 
   if (hasUngradedQuestions) {
     try {
       const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
 
-      // ✅ Next.js 16: cookies() returns a Promise — must be awaited
-      const cookieStore = await cookies()
-      const cookieHeader = cookieStore.toString()
-
       const gradeRes = await fetch(`${baseUrl}/api/grade-answers`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Cookie: cookieHeader,
-        },
-        body: JSON.stringify({ session_id: id })
+        headers: { 'Content-Type': 'application/json' },
+        // Pass user id in body so grade-answers can verify ownership
+        // without needing cookie forwarding
+        body: JSON.stringify({ session_id: id, user_id: user.id }),
       })
+
       const gradeData = await gradeRes.json()
       console.log('grade-answers result:', gradeData)
 
-      // Re-fetch session to get updated scores
-      const { data: updatedSessionData } = await supabase.rpc(
-        'get_student_sessions',
-        { student_id_param: user.id }
-      )
-      const updatedSession = (updatedSessionData ?? []).find(
-        (s: any) => s.id === id
-      )
-      if (updatedSession) session = updatedSession
+      // Re-fetch session to get updated scores after grading
+      const { data: updatedSession } = await (supabase.from('exam_sessions') as any)
+        .select('id, exam_id, student_id, status, answers, started_at, submitted_at, score, max_score, cheating_score, grading_details, ai_report')
+        .eq('id', id)
+        .eq('student_id', user.id)
+        .single() as { data: ExamSession | null; error: any }
+
+      if (updatedSession) {
+        Object.assign(session, updatedSession)
+      }
     } catch (err) {
       console.error('Auto-grading failed:', err)
     }
   }
 
-  // Fetch exam
-  const { data: examData } = await supabase.rpc('get_exam_by_id', {
-    exam_id_param: session.exam_id
-  })
-  const exam = examData?.[0] ?? null
+  // ── Fetch exam directly ───────────────────────────────────────────────────
+  const { data: exam } = await (supabase.from('exams') as any)
+    .select('id, title, pass_marks, duration_minutes')
+    .eq('id', session.exam_id)
+    .single() as { data: Exam | null; error: any }
 
-  // Fetch questions
-  const { data: rawQuestions } = await supabase.rpc('get_exam_questions', {
-    exam_id_param: session.exam_id
-  })
+  // ── Fetch questions directly ──────────────────────────────────────────────
+  const { data: rawQuestions } = await (supabase.from('questions') as any)
+    .select('id, order_index, type, question_text, options, correct_answer, marks, grading_hint')
+    .eq('exam_id', session.exam_id)
+    .order('order_index', { ascending: true })
+
   const questions = (rawQuestions ?? []).map((q: any) => {
     let options = null
     if (q.options) {
@@ -93,41 +81,44 @@ export default async function ResultsPage({
         try { parsed = JSON.parse(q.options) } catch { parsed = [] }
       }
       options = Array.isArray(parsed)
-        ? parsed.map((o: any) => typeof o === 'object' ? o.value : o)
+        ? parsed.map((o: any) => (typeof o === 'object' ? o.value : o))
         : null
     }
     return { ...q, options }
   })
 
-  // Fetch flags via RPC
-  const { data: flags } = await supabase.rpc('get_exam_flags', {
-    session_id_param: id
-  })
+  // ── Fetch flags directly ──────────────────────────────────────────────────
+  const { data: flags } = await (supabase.from('flags') as any)
+    .select('id, flag_type, severity, created_at, metadata')
+    .eq('session_id', id)
+    .order('created_at', { ascending: false })
 
-  // Score
-  const scorePercentage = session.max_score > 0
-    ? ((session.score / session.max_score) * 100).toFixed(1)
-    : '0'
+  // ── Derived values ────────────────────────────────────────────────────────
+  const scorePercentage =
+    session.max_score > 0
+      ? ((session.score / session.max_score) * 100).toFixed(1)
+      : '0'
 
   const isPassed = exam?.pass_marks
     ? session.score >= exam.pass_marks
     : parseFloat(scorePercentage) >= 50
 
-  const timeTaken = session.started_at && session.submitted_at
-    ? Math.round(
-        (new Date(session.submitted_at).getTime() -
-          new Date(session.started_at).getTime()) / 60000
-      )
-    : 0
+  const timeTaken =
+    session.started_at && session.submitted_at
+      ? Math.round(
+          (new Date(session.submitted_at).getTime() -
+            new Date(session.started_at).getTime()) /
+            60000
+        )
+      : 0
 
-  // Flag type counts
   const flagTypeCounts: Record<string, number> = {}
   for (const flag of (flags ?? []) as any[]) {
-    const key = flag.flag_type ?? flag.event_type
+    const key = flag.flag_type ?? flag.event_type ?? 'unknown'
     flagTypeCounts[key] = (flagTypeCounts[key] ?? 0) + 1
   }
 
-  const gradingDetails = session.grading_details ?? {}
+  const gradingDetails = (session.grading_details as Record<string, any>) ?? {}
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -139,17 +130,13 @@ export default async function ResultsPage({
               <h1 className="text-3xl font-bold text-gray-900">Exam Results</h1>
               <p className="text-gray-600 mt-1">{exam?.title}</p>
             </div>
-            <a
-              href="/student/home"
-              className="text-blue-600 hover:text-blue-700 font-medium"
-            >
+            <a href="/student/home" className="text-blue-600 hover:text-blue-700 font-medium">
               ← Back to Home
             </a>
           </div>
         </div>
       </div>
 
-      {/* Main Content */}
       <div className="max-w-4xl mx-auto px-6 py-8">
         {/* Score Card */}
         <div className="bg-white rounded-lg shadow-md p-8 mb-8">
@@ -173,11 +160,13 @@ export default async function ResultsPage({
               <div>
                 <p className="text-gray-600">Status</p>
                 <div className="mt-2">
-                  <span className={`inline-block px-4 py-2 rounded-full font-semibold ${
-                    isPassed
-                      ? 'bg-green-100 text-green-800'
-                      : 'bg-red-100 text-red-800'
-                  }`}>
+                  <span
+                    className={`inline-block px-4 py-2 rounded-full font-semibold ${
+                      isPassed
+                        ? 'bg-green-100 text-green-800'
+                        : 'bg-red-100 text-red-800'
+                    }`}
+                  >
                     {isPassed ? '✓ Passed' : '✗ Failed'}
                   </span>
                 </div>
@@ -194,25 +183,21 @@ export default async function ResultsPage({
 
         {/* Question Review */}
         <div className="bg-white rounded-lg shadow-md p-8 mb-8">
-          <h2 className="text-2xl font-bold text-gray-900 mb-6">
-            Question Review
-          </h2>
+          <h2 className="text-2xl font-bold text-gray-900 mb-6">Question Review</h2>
           <div className="space-y-6">
             {questions.map((question: any, index: number) => {
               const detail = gradingDetails[question.id]
-              const studentAnswer = detail?.student_answer
-                ?? session.answers?.[question.id]
-                ?? null
+              const studentAnswer =
+                detail?.student_answer ??
+                (session.answers as any)?.[question.id] ??
+                null
               const marksAwarded = detail?.marks_awarded ?? null
               const isCorrect = detail?.is_correct ?? null
               const needsGrading = detail?.needs_grading ?? false
-              const aiFeedback = (detail as any)?.ai_feedback ?? null
+              const aiFeedback = detail?.ai_feedback ?? null
 
               return (
-                <div
-                  key={question.id}
-                  className="border border-gray-200 rounded-lg p-6"
-                >
+                <div key={question.id} className="border border-gray-200 rounded-lg p-6">
                   <div className="flex items-start justify-between">
                     <div className="flex-1">
                       <p className="text-sm font-semibold text-gray-500 mb-2">
@@ -229,9 +214,11 @@ export default async function ResultsPage({
                         </p>
                         {question.type === 'mcq' ? (
                           <div className="flex items-center">
-                            <span className={`text-base ${
-                              isCorrect ? 'text-green-600' : 'text-red-600'
-                            }`}>
+                            <span
+                              className={`text-base ${
+                                isCorrect ? 'text-green-600' : 'text-red-600'
+                              }`}
+                            >
                               {isCorrect ? '✓' : '✗'}
                             </span>
                             <span className="ml-2 text-gray-900">
@@ -269,7 +256,7 @@ export default async function ResultsPage({
                       {needsGrading === true && marksAwarded === null && (
                         <div className="mb-4 bg-yellow-50 border border-yellow-200 rounded p-3">
                           <p className="text-sm text-yellow-700">
-                            ⏳ This answer is pending manual review.
+                            ⏳ This answer is pending AI review.
                           </p>
                         </div>
                       )}
@@ -281,9 +268,11 @@ export default async function ResultsPage({
                       {needsGrading === true && marksAwarded === null ? (
                         <p className="text-2xl font-bold text-yellow-500">—</p>
                       ) : (
-                        <p className={`text-2xl font-bold ${
-                          isCorrect ? 'text-green-600' : 'text-red-600'
-                        }`}>
+                        <p
+                          className={`text-2xl font-bold ${
+                            isCorrect ? 'text-green-600' : 'text-red-600'
+                          }`}
+                        >
                           {marksAwarded ?? 0}/{question.marks}
                         </p>
                       )}
@@ -309,13 +298,15 @@ export default async function ResultsPage({
             </div>
             <div>
               <p className="text-gray-600">Cheating Risk Score</p>
-              <p className={`text-3xl font-bold mt-2 ${
-                (session.cheating_score ?? 0) > 0.7
-                  ? 'text-red-600'
-                  : (session.cheating_score ?? 0) > 0.4
-                  ? 'text-yellow-600'
-                  : 'text-green-600'
-              }`}>
+              <p
+                className={`text-3xl font-bold mt-2 ${
+                  (session.cheating_score ?? 0) > 0.7
+                    ? 'text-red-600'
+                    : (session.cheating_score ?? 0) > 0.4
+                    ? 'text-yellow-600'
+                    : 'text-green-600'
+                }`}
+              >
                 {((session.cheating_score ?? 0) * 100).toFixed(0)}%
               </p>
             </div>

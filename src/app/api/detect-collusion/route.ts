@@ -1,5 +1,6 @@
-import { NextRequest, NextResponse } from "next/server";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { NextRequest, NextResponse } from 'next/server';
+import { createSupabaseServerClient } from '@/lib/supabase/server';
+import { compareAnswers } from '@/lib/semantic-similarity';
 
 interface SessionAnswers {
   session_id: string;
@@ -10,85 +11,42 @@ interface SessionAnswers {
   submitted_at: string | null;
 }
 
+interface Question {
+  id: string;
+  type: string;
+  question_text: string;
+}
+
 interface CollusionPair {
   student_a_id: string;
   student_a_name: string;
   student_b_id: string;
   student_b_name: string;
-  similarity_score: number; // 0-100
-  matching_questions: number;
-  total_questions: number;
-  matched_question_ids: string[];
-  severity: "low" | "medium" | "high";
+  question_id: string;
+  question_text: string;
+  similarity_percent: number; // 0-100
+  verdict: string;
+  explanation: string;
 }
 
 interface CollusionResult {
   exam_id: string;
-  total_sessions: number;
-  pairs_analyzed: number;
-  suspicious_pairs: CollusionPair[];
-  collusion_detected: boolean;
+  total_pairs_checked: number;
+  flagged_pairs: CollusionPair[];
   summary: string;
 }
 
-/**
- * Compute Jaccard-style answer similarity between two answer maps.
- * Only compares questions answered by BOTH students.
- */
-function computeAnswerSimilarity(
-  answersA: Record<string, string>,
-  answersB: Record<string, string>
-): {
-  similarity: number;
-  matchingQuestions: number;
-  totalCompared: number;
-  matchedIds: string[];
-} {
-  const keysA = new Set(Object.keys(answersA));
-  const keysB = new Set(Object.keys(answersB));
-
-  // Questions answered by both
-  const commonKeys = [...keysA].filter((k) => keysB.has(k));
-
-  if (commonKeys.length === 0) {
-    return { similarity: 0, matchingQuestions: 0, totalCompared: 0, matchedIds: [] };
+function getFlagSeverity(verdict: string): 'low' | 'medium' | 'high' | 'critical' {
+  switch (verdict) {
+    case 'likely_copied':
+      return 'critical';
+    case 'highly_similar':
+      return 'high';
+    case 'similar':
+      return 'medium';
+    default:
+      return 'low';
   }
-
-  const matchedIds: string[] = [];
-
-  for (const qId of commonKeys) {
-    const a = (answersA[qId] ?? "").trim().toLowerCase();
-    const b = (answersB[qId] ?? "").trim().toLowerCase();
-
-    if (a === "" || b === "") continue; // skip unanswered
-
-    if (a === b) {
-      matchedIds.push(qId);
-    }
-  }
-
-  const totalCompared = commonKeys.filter(
-    (k) =>
-      (answersA[k] ?? "").trim() !== "" && (answersB[k] ?? "").trim() !== ""
-  ).length;
-
-  const similarity =
-    totalCompared > 0
-      ? Math.round((matchedIds.length / totalCompared) * 100)
-      : 0;
-
-  return {
-    similarity,
-    matchingQuestions: matchedIds.length,
-    totalCompared,
-    matchedIds,
-  };
-}
-
-function getSeverity(score: number): "low" | "medium" | "high" {
-  if (score >= 85) return "high";
-  if (score >= 70) return "medium";
-  return "low";
 }
 
 export async function POST(req: NextRequest) {
@@ -100,41 +58,41 @@ export async function POST(req: NextRequest) {
     } = await supabase.auth.getUser();
 
     if (authError || !user) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const body = await req.json();
-    const { exam_id, threshold = 70 } = body;
+    const { exam_id, question_id } = body;
 
     if (!exam_id) {
       return NextResponse.json(
-        { error: "exam_id is required" },
+        { error: 'exam_id is required' },
         { status: 400 }
       );
     }
 
     // Verify teacher owns this exam
-    const { data: examData, error: examError } = await supabase.rpc(
-      "get_teacher_exam",
+    const { data: examData, error: examError } = await (supabase.rpc as any)(
+      'get_teacher_exam',
       { exam_id_param: exam_id, teacher_id_param: user.id }
     );
 
     if (examError || !examData) {
       return NextResponse.json(
-        { error: "Exam not found or access denied" },
+        { error: 'Exam not found or access denied' },
         { status: 404 }
       );
     }
 
     // Fetch all submitted sessions for this exam
-    const { data: sessionsRaw, error: sessionsError } = await supabase.rpc(
+    const { data: sessionsRaw, error: sessionsError } = await (supabase.rpc as any)(
       'get_exam_sessions_for_collusion',
       { exam_id_param: exam_id }
     );
 
     if (sessionsError) {
       return NextResponse.json(
-        { error: "Failed to fetch sessions" },
+        { error: 'Failed to fetch sessions' },
         { status: 500 }
       );
     }
@@ -146,92 +104,164 @@ export async function POST(req: NextRequest) {
     if (sessions.length < 2) {
       return NextResponse.json<CollusionResult>({
         exam_id,
-        total_sessions: sessions.length,
-        pairs_analyzed: 0,
-        suspicious_pairs: [],
-        collusion_detected: false,
-        summary: "Not enough submissions to analyze collusion.",
+        total_pairs_checked: 0,
+        flagged_pairs: [],
+        summary: 'Not enough submissions to analyze collusion.',
       });
     }
 
-    // Compare every pair of students (O(n²))
-    const suspiciousPairs: CollusionPair[] = [];
-    let pairsAnalyzed = 0;
+    // Fetch all questions
+    const { data: questionsRaw, error: questionsError } = await (supabase.rpc as any)(
+      'get_exam_questions',
+      { exam_id_param: exam_id }
+    );
 
-    for (let i = 0; i < sessions.length; i++) {
-      for (let j = i + 1; j < sessions.length; j++) {
-        const sa = sessions[i];
-        const sb = sessions[j];
+    if (questionsError) {
+      return NextResponse.json(
+        { error: 'Failed to fetch questions' },
+        { status: 500 }
+      );
+    }
 
-        const { similarity, matchingQuestions, totalCompared, matchedIds } =
-          computeAnswerSimilarity(sa.answers, sb.answers);
+    const allQuestions: Question[] = questionsRaw ?? [];
 
-        pairsAnalyzed++;
+    // Filter to only short_answer and long_answer questions (not MCQ)
+    const questionsToCheck = question_id
+      ? allQuestions.filter(
+          (q) => q.id === question_id && (q.type === 'short_answer' || q.type === 'long_answer')
+        )
+      : allQuestions.filter((q) => q.type === 'short_answer' || q.type === 'long_answer');
 
-        if (similarity >= threshold && totalCompared >= 3) {
-          suspiciousPairs.push({
-            student_a_id: sa.student_id,
-            student_a_name: sa.student_name ?? "Unknown",
-            student_b_id: sb.student_id,
-            student_b_name: sb.student_name ?? "Unknown",
-            similarity_score: similarity,
-            matching_questions: matchingQuestions,
-            total_questions: totalCompared,
-            matched_question_ids: matchedIds,
-            severity: getSeverity(similarity),
-          });
+    if (questionsToCheck.length === 0) {
+      return NextResponse.json<CollusionResult>({
+        exam_id,
+        total_pairs_checked: 0,
+        flagged_pairs: [],
+        summary: 'No subjective questions found to check for collusion.',
+      });
+    }
+
+    const flaggedPairs: CollusionPair[] = [];
+    let totalPairsChecked = 0;
+
+    // For each question, compare every pair of students' answers
+    for (const question of questionsToCheck) {
+      // Get student answers for this question
+      const answersByStudent = sessions
+        .map((session) => ({
+          session_id: session.session_id,
+          student_id: session.student_id,
+          student_name: session.student_name,
+          student_email: session.student_email,
+          answer: (session.answers[question.id] || '').trim(),
+        }))
+        .filter((item) => item.answer.length > 0);
+
+      if (answersByStudent.length < 2) continue;
+
+      // Compare every pair of answers for this question
+      for (let i = 0; i < answersByStudent.length; i++) {
+        for (let j = i + 1; j < answersByStudent.length; j++) {
+          const studentA = answersByStudent[i];
+          const studentB = answersByStudent[j];
+
+          totalPairsChecked++;
+
+          try {
+            const result = await compareAnswers(studentA.answer, studentB.answer);
+
+            // Flag if similarity is high or very high
+            if (result.verdict === 'highly_similar' || result.verdict === 'likely_copied') {
+              flaggedPairs.push({
+                student_a_id: studentA.student_id,
+                student_a_name: studentA.student_name,
+                student_b_id: studentB.student_id,
+                student_b_name: studentB.student_name,
+                question_id: question.id,
+                question_text: question.question_text,
+                similarity_percent: result.similarity_percent,
+                verdict: result.verdict,
+                explanation: result.explanation,
+              });
+
+              // Create flag in database for student A
+              const severity = getFlagSeverity(result.verdict);
+              await (supabase.rpc as any)('insert_flag', {
+                session_id_param: studentA.session_id,
+                student_id_param: studentA.student_id,
+                exam_id_param: exam_id,
+                flag_type_param: 'collusion_detected',
+                severity_param: severity,
+                metadata_param: {
+                  student_b_session_id: studentB.session_id,
+                  student_b_name: studentB.student_name,
+                  student_b_email: studentB.student_email,
+                  question_id: question.id,
+                  question_text: question.question_text,
+                  similarity_percent: result.similarity_percent,
+                  verdict: result.verdict,
+                  explanation: result.explanation,
+                },
+              });
+
+              // Create flag in database for student B
+              await (supabase.rpc as any)('insert_flag', {
+                session_id_param: studentB.session_id,
+                student_id_param: studentB.student_id,
+                exam_id_param: exam_id,
+                flag_type_param: 'collusion_detected',
+                severity_param: severity,
+                metadata_param: {
+                  student_b_session_id: studentA.session_id,
+                  student_b_name: studentA.student_name,
+                  student_b_email: studentA.student_email,
+                  question_id: question.id,
+                  question_text: question.question_text,
+                  similarity_percent: result.similarity_percent,
+                  verdict: result.verdict,
+                  explanation: result.explanation,
+                },
+              });
+            }
+          } catch (error) {
+            console.error(
+              `Error comparing answers for question ${question.id}:`,
+              error
+            );
+            // Continue with next pair
+          }
         }
       }
     }
 
     // Sort by similarity descending
-    suspiciousPairs.sort((a, b) => b.similarity_score - a.similarity_score);
+    flaggedPairs.sort((a, b) => b.similarity_percent - a.similarity_percent);
 
-    const highCount = suspiciousPairs.filter((p) => p.severity === "high").length;
-    const mediumCount = suspiciousPairs.filter(
-      (p) => p.severity === "medium"
+    const criticalCount = flaggedPairs.filter(
+      (p) => p.verdict === 'likely_copied'
     ).length;
+    const highCount = flaggedPairs.filter((p) => p.verdict === 'highly_similar').length;
 
-    let summary = `Analyzed ${pairsAnalyzed} student pairs. `;
-    if (suspiciousPairs.length === 0) {
-      summary += "No suspicious similarity detected.";
+    let summary = `Analyzed ${totalPairsChecked} answer pairs across ${questionsToCheck.length} question(s). `;
+    if (flaggedPairs.length === 0) {
+      summary += 'No suspicious similarity detected.';
     } else {
-      summary += `Found ${suspiciousPairs.length} suspicious pair(s): ${highCount} high, ${mediumCount} medium severity.`;
-    }
-
-    // Persist suspicious pairs as flags in the database
-    for (const pair of suspiciousPairs) {
-      const sessionA = sessions.find((s) => s.student_id === pair.student_a_id);
-      if (sessionA) {
-        await supabase.rpc('insert_flag', {
-          session_id_param: sessionA.session_id,
-          student_id_param: pair.student_a_id,
-          exam_id_param: exam_id,
-          flag_type_param: 'collusion_suspected',
-          severity_param: pair.severity,
-          metadata_param: {
-            similarity_score: pair.similarity_score,
-            compared_with: pair.student_b_id,
-            compared_with_name: pair.student_b_name,
-            matching_questions: pair.matching_questions,
-            total_questions: pair.total_questions,
-          },
-        });
+      summary += `Found ${flaggedPairs.length} highly similar pair(s): ${criticalCount} likely copied, ${highCount} highly similar.`;
+      if (criticalCount > 0) {
+        summary += ' Manual review strongly recommended.';
       }
     }
 
     return NextResponse.json<CollusionResult>({
       exam_id,
-      total_sessions: sessions.length,
-      pairs_analyzed: pairsAnalyzed,
-      suspicious_pairs: suspiciousPairs,
-      collusion_detected: suspiciousPairs.length > 0,
+      total_pairs_checked: totalPairsChecked,
+      flagged_pairs: flaggedPairs,
       summary,
     });
   } catch (err) {
-    console.error("detect-collusion error:", err);
+    console.error('detect-collusion error:', err);
     return NextResponse.json(
-      { error: "Internal server error" },
+      { error: 'Internal server error' },
       { status: 500 }
     );
   }

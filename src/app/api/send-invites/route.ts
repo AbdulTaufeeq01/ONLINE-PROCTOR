@@ -1,10 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
-import { Resend } from 'resend';
+import { resend, EMAIL_FROM, buildInviteEmailHtml } from '@/lib/resend';
+import { ExamInvite, Exam } from '@/types/database';
 import crypto from 'crypto';
-
-// Initialize Resend client
-const resend = new Resend(process.env.RESEND_API_KEY);
 
 export async function POST(request: NextRequest) {
   try {
@@ -34,12 +32,11 @@ export async function POST(request: NextRequest) {
     }
 
     // Step 2: Fetch and verify exam ownership
-    const { data: exam, error: examError } = await supabase
-      .from('exams')
+    const { data: exam, error: examError } = await (supabase.from('exams') as any)
       .select('*')
       .eq('id', exam_id)
       .eq('teacher_id', user.id)
-      .single();
+      .single() as { data: Exam | null; error: any };
 
     if (examError || !exam) {
       return NextResponse.json(
@@ -49,7 +46,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Step 3: Create invites and send emails
-    const createdInvites = [];
+    const createdInvites: ExamInvite[] = [];
 
     for (const student of students) {
       try {
@@ -57,8 +54,7 @@ export async function POST(request: NextRequest) {
         const token = crypto.randomBytes(32).toString('hex');
 
         // Insert into exam_invites table
-        const { data: invite, error: insertError } = await supabase
-          .from('exam_invites')
+        const { data: invite, error: insertError } = await (supabase.from('exam_invites') as any)
           .insert({
             exam_id,
             student_email: student.email,
@@ -76,40 +72,15 @@ export async function POST(request: NextRequest) {
 
         // Send email via Resend
         const joinLink = `${process.env.NEXT_PUBLIC_APP_URL}/join/${token}`;
-        const studentGreeting = student.name ? `Hi ${student.name}` : 'Hello';
-
-        const emailHtml = `
-          <html>
-            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-              <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h2>${studentGreeting},</h2>
-                <p>You have been invited to take the exam:</p>
-                <h3 style="color: #4f46e5;">${exam.title}</h3>
-                <p>Click the link below to join and begin the exam:</p>
-                <a href="${joinLink}" style="display: inline-block; background-color: #4f46e5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 20px 0;">
-                  Join Exam
-                </a>
-                <p style="margin-top: 20px;">
-                  Or copy this link: <br/>
-                  <code style="background: #f5f5f5; padding: 8px; display: inline-block; margin-top: 8px;">
-                    ${joinLink}
-                  </code>
-                </p>
-                <p style="margin-top: 20px; font-size: 14px; color: #666;">
-                  <strong>Important:</strong> This invitation link can only be used once. 
-                  Please use it carefully and keep it private.
-                </p>
-                <hr style="margin-top: 30px; border: none; border-top: 1px solid #ddd;" />
-                <p style="font-size: 12px; color: #999;">
-                  ProctorApp © 2026. All rights reserved.
-                </p>
-              </div>
-            </body>
-          </html>
-        `;
+        const emailHtml = buildInviteEmailHtml({
+          studentName: student.name || 'Student',
+          examTitle: exam.title,
+          durationMinutes: exam.duration_minutes || 60,
+          joinUrl: joinLink
+        });
 
         const emailResponse = await resend.emails.send({
-          from: 'ProctorApp <onboarding@resend.dev>',
+          from: EMAIL_FROM,
           to: student.email,
           subject: `You are invited to: ${exam.title}`,
           html: emailHtml,

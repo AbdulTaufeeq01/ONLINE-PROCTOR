@@ -77,8 +77,7 @@ export default function CreateExamPage() {
       }
 
       // Insert exam into database
-      const { data: newExam, error: insertError } = await supabase
-        .from('exams')
+      const { data: newExam, error: insertError } = await (supabase.from('exams') as any)
         .insert({
           title: data.title,
           description: data.description || null,

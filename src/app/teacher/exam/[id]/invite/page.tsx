@@ -51,7 +51,7 @@ export default async function InvitePage({ params }: InvitePageProps) {
 
   // Fetch exam invites
   const { data: invitesData, error: invitesError } = 
-    await supabase.rpc('get_teacher_invites', {
+    await (supabase.rpc as any)('get_teacher_invites', {
       exam_id_param: examId,
       teacher_id_param: user.id
     })

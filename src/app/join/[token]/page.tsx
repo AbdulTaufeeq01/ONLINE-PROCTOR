@@ -1,6 +1,7 @@
 import { redirect } from 'next/navigation';
 import Link from 'next/link';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
+import { ExamInvite, Exam, ExamSession } from '@/types/database';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 
@@ -28,25 +29,32 @@ export default async function JoinExamPage({ params }: Props) {
   const { token } = await params;
   const supabase = await createSupabaseServerClient();
 
-  const { data: { user }, error: userError } = await supabase.auth.getUser();
+  // Auth check
+  const {
+    data: { user },
+    error: userError,
+  } = await supabase.auth.getUser();
+
   if (!user || userError) {
     redirect(`/auth/login?redirect=/join/${token}`);
   }
 
-  // Fetch invite
-  const { data: inviteData, error: inviteError } =
-    await supabase.rpc('get_invite_by_token', { token_param: token });
+  // Fetch invite directly — avoids RPC param name issues
+  const { data: invite, error: inviteError } = await (supabase.from('exam_invites') as any)
+    .select('id, exam_id, student_email, student_name, token, used')
+    .eq('token', token)
+    .single() as { data: ExamInvite | null; error: any };
 
-  const invite = inviteData?.[0] ?? null;
   if (!invite || inviteError) {
     return <ErrorPage message="Invalid invite link" />;
   }
 
-  // Fetch exam
-  const { data: examData, error: examError } =
-    await supabase.rpc('get_exam_by_id', { exam_id_param: invite.exam_id });
+  // Fetch exam directly
+  const { data: exam, error: examError } = await (supabase.from('exams') as any)
+    .select('id, title, status, duration_minutes')
+    .eq('id', invite.exam_id)
+    .single() as { data: Exam | null; error: any };
 
-  const exam = examData?.[0] ?? null;
   if (!exam || examError) {
     return <ErrorPage message="Exam not found" />;
   }
@@ -55,14 +63,12 @@ export default async function JoinExamPage({ params }: Props) {
     return <ErrorPage message="This exam is not currently active" />;
   }
 
-  // Check for ANY existing session for this exam first
-  const { data: existingSessions } = await supabase.rpc(
-    'get_student_sessions', { student_id_param: user.id }
-  );
-
-  const existingSession = (existingSessions ?? []).find(
-    (s: any) => s.exam_id === invite.exam_id
-  );
+  // Check for existing session for this student + exam
+  const { data: existingSession } = await (supabase.from('exam_sessions') as any)
+    .select('id, status, exam_id')
+    .eq('student_id', user.id)
+    .eq('exam_id', invite.exam_id)
+    .maybeSingle() as { data: ExamSession | null; error: any };
 
   if (existingSession) {
     if (existingSession.status === 'submitted') {
@@ -72,24 +78,30 @@ export default async function JoinExamPage({ params }: Props) {
     }
   }
 
-  // No existing session — check if invite is used by someone else
+  // Check if invite already used by someone else
   if (invite.used === true) {
     return <ErrorPage message="This invite link has already been used" />;
   }
 
-  // Create session — this also marks invite as used atomically inside the RPC
+  // Create session — p_exam_id, p_student_id, p_invite_id match the RPC definition
   const { data: sessionData, error: createSessionError } =
-    await supabase.rpc('create_exam_session', {
-      exam_id_param: invite.exam_id,
-      student_id_param: user.id,
-      invite_id_param: invite.id,
+    await (supabase.rpc as any)('create_exam_session', {
+      p_exam_id:    invite.exam_id,
+      p_student_id: user.id,
+      p_invite_id:  invite.id,
     });
 
-  const newSession = sessionData?.[0] ?? null;
-
-  if (!newSession || createSessionError) {
-    console.error('create session error:', createSessionError);
-    return <ErrorPage message="Failed to create exam session" />;
+  if (createSessionError || !sessionData?.success) {
+    console.error(
+      'create session error:',
+      createSessionError,
+      sessionData
+    );
+    return (
+      <ErrorPage
+        message={sessionData?.error || 'Failed to create exam session'}
+      />
+    );
   }
 
   redirect(`/student/exam/${exam.id}`);

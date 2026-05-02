@@ -68,8 +68,7 @@ export function LoginForm({ redirectTo }: LoginFormProps) {
       }
 
       // Fetch user profile to determine role
-      const { data: profile, error: profileError } = await supabase
-        .from('profiles')
+      const { data: profile, error: profileError } = await (supabase.from('profiles') as any)
         .select('role')
         .eq('id', authData.user.id)
         .single();
