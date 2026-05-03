@@ -24,7 +24,7 @@ interface CollusionPair {
   student_b_name: string;
   question_id: string;
   question_text: string;
-  similarity_percent: number; // 0-100
+  similarity_percent: number;
   verdict: string;
   explanation: string;
 }
@@ -34,6 +34,21 @@ interface CollusionResult {
   total_pairs_checked: number;
   flagged_pairs: CollusionPair[];
   summary: string;
+}
+
+function normalizeAnswerValue(value: unknown): string {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map((item) => String(item)).join(' ').trim();
+
+  if (value && typeof value === 'object') {
+    const maybeRecord = value as Record<string, unknown>;
+    const nested = maybeRecord.student_answer ?? maybeRecord.answer ?? maybeRecord.value;
+    if (typeof nested === 'string') return nested.trim();
+    if (typeof nested === 'number' || typeof nested === 'boolean') return String(nested);
+  }
+
+  return '';
 }
 
 function getFlagSeverity(verdict: string): 'low' | 'medium' | 'high' | 'critical' {
@@ -65,10 +80,7 @@ export async function POST(req: NextRequest) {
     const { exam_id, question_id } = body;
 
     if (!exam_id) {
-      return NextResponse.json(
-        { error: 'exam_id is required' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'exam_id is required' }, { status: 400 });
     }
 
     // Verify teacher owns this exam
@@ -90,16 +102,38 @@ export async function POST(req: NextRequest) {
       { exam_id_param: exam_id }
     );
 
+    console.log('[detect-collusion] Sessions fetch:', {
+      exam_id,
+      sessionsError: sessionsError?.message,
+      sessionCount: sessionsRaw?.length,
+    });
+
     if (sessionsError) {
+      console.error('[detect-collusion] Sessions RPC error:', sessionsError);
       return NextResponse.json(
-        { error: 'Failed to fetch sessions' },
+        { error: 'Failed to fetch sessions', details: sessionsError?.message },
         { status: 500 }
       );
     }
 
-    const sessions: SessionAnswers[] = (sessionsRaw ?? []).filter(
-      (s: SessionAnswers) => s.answers && Object.keys(s.answers).length > 0
-    );
+    // ✅ Remap RPC fields to SessionAnswers shape
+    // The RPC returns 'id' not 'session_id', and may not return student_name/email
+    const sessions: SessionAnswers[] = (sessionsRaw ?? [])
+      .map((s: any) => ({
+        session_id:    s.session_id   ?? s.id,
+        student_id:    s.student_id,
+        student_name:  s.student_name  ?? s.name ?? `Student (${s.student_id?.slice(0, 8)})`,
+        student_email: s.student_email ?? s.email ?? '',
+        answers:       s.answers ?? {},
+        submitted_at:  s.submitted_at ?? null,
+      }))
+      .filter((s: SessionAnswers) => s.answers && Object.keys(s.answers).length > 0);
+
+    console.log('[detect-collusion] Mapped sessions:', sessions.map(s => ({
+      session_id: s.session_id,
+      student_name: s.student_name,
+      answer_keys: Object.keys(s.answers),
+    })));
 
     if (sessions.length < 2) {
       return NextResponse.json<CollusionResult>({
@@ -113,12 +147,19 @@ export async function POST(req: NextRequest) {
     // Fetch all questions
     const { data: questionsRaw, error: questionsError } = await (supabase.rpc as any)(
       'get_exam_questions',
-      { exam_id_param: exam_id }
+      { p_exam_id: exam_id }
     );
 
+    console.log('[detect-collusion] Questions fetch:', {
+      exam_id,
+      questionsError: questionsError?.message,
+      questionCount: questionsRaw?.length,
+    });
+
     if (questionsError) {
+      console.error('[detect-collusion] Questions RPC error:', questionsError);
       return NextResponse.json(
-        { error: 'Failed to fetch questions' },
+        { error: 'Failed to fetch questions', details: questionsError?.message },
         { status: 500 }
       );
     }
@@ -146,20 +187,21 @@ export async function POST(req: NextRequest) {
 
     // For each question, compare every pair of students' answers
     for (const question of questionsToCheck) {
-      // Get student answers for this question
       const answersByStudent = sessions
         .map((session) => ({
-          session_id: session.session_id,
-          student_id: session.student_id,
-          student_name: session.student_name,
+          session_id:    session.session_id,
+          student_id:    session.student_id,
+          student_name:  session.student_name,
           student_email: session.student_email,
-          answer: (session.answers[question.id] || '').trim(),
+          answer:        normalizeAnswerValue(session.answers?.[question.id]),
         }))
         .filter((item) => item.answer.length > 0);
 
+      console.log(`[detect-collusion] Question ${question.id}: ${answersByStudent.length} answers found`);
+
       if (answersByStudent.length < 2) continue;
 
-      // Compare every pair of answers for this question
+      // Compare every pair
       for (let i = 0; i < answersByStudent.length; i++) {
         for (let j = i + 1; j < answersByStudent.length; j++) {
           const studentA = answersByStudent[i];
@@ -170,65 +212,81 @@ export async function POST(req: NextRequest) {
           try {
             const result = await compareAnswers(studentA.answer, studentB.answer);
 
-            // Flag if similarity is high or very high
+            console.log(
+              '[detect-collusion] Comparison result for',
+              studentA.student_name,
+              'vs',
+              studentB.student_name,
+              ':',
+              result.verdict,
+              result.similarity_percent
+            );
+
             if (result.verdict === 'highly_similar' || result.verdict === 'likely_copied') {
               flaggedPairs.push({
-                student_a_id: studentA.student_id,
-                student_a_name: studentA.student_name,
-                student_b_id: studentB.student_id,
-                student_b_name: studentB.student_name,
-                question_id: question.id,
-                question_text: question.question_text,
+                student_a_id:       studentA.student_id,
+                student_a_name:     studentA.student_name,
+                student_b_id:       studentB.student_id,
+                student_b_name:     studentB.student_name,
+                question_id:        question.id,
+                question_text:      question.question_text,
                 similarity_percent: result.similarity_percent,
-                verdict: result.verdict,
-                explanation: result.explanation,
+                verdict:            result.verdict,
+                explanation:        result.explanation,
               });
 
-              // Create flag in database for student A
               const severity = getFlagSeverity(result.verdict);
-              await (supabase.rpc as any)('insert_flag', {
-                session_id_param: studentA.session_id,
-                student_id_param: studentA.student_id,
-                exam_id_param: exam_id,
-                flag_type_param: 'collusion_detected',
-                severity_param: severity,
-                metadata_param: {
-                  student_b_session_id: studentB.session_id,
-                  student_b_name: studentB.student_name,
-                  student_b_email: studentB.student_email,
-                  question_id: question.id,
-                  question_text: question.question_text,
-                  similarity_percent: result.similarity_percent,
-                  verdict: result.verdict,
-                  explanation: result.explanation,
-                },
-              });
+              const sharedMeta = {
+                question_id:        question.id,
+                question_text:      question.question_text,
+                similarity_percent: result.similarity_percent,
+                verdict:            result.verdict,
+                explanation:        result.explanation,
+              };
 
-              // Create flag in database for student B
-              await (supabase.rpc as any)('insert_flag', {
-                session_id_param: studentB.session_id,
-                student_id_param: studentB.student_id,
-                exam_id_param: exam_id,
-                flag_type_param: 'collusion_detected',
-                severity_param: severity,
-                metadata_param: {
-                  student_b_session_id: studentA.session_id,
-                  student_b_name: studentA.student_name,
-                  student_b_email: studentA.student_email,
-                  question_id: question.id,
-                  question_text: question.question_text,
-                  similarity_percent: result.similarity_percent,
-                  verdict: result.verdict,
-                  explanation: result.explanation,
-                },
-              });
+              // Flag student A
+              try {
+                await (supabase.rpc as any)('insert_flag', {
+                  session_id_param: studentA.session_id,
+                  student_id_param: studentA.student_id,
+                  exam_id_param:    exam_id,
+                  flag_type_param:  'collusion_detected',
+                  severity_param:   severity,
+                  metadata_param: {
+                    ...sharedMeta,
+                    student_b_session_id: studentB.session_id,
+                    student_b_name:       studentB.student_name,
+                    student_b_email:      studentB.student_email,
+                  },
+                });
+              } catch (flagErr) {
+                console.error('[detect-collusion] Failed to insert flag for student A:', flagErr);
+              }
+
+              // Flag student B
+              try {
+                await (supabase.rpc as any)('insert_flag', {
+                  session_id_param: studentB.session_id,
+                  student_id_param: studentB.student_id,
+                  exam_id_param:    exam_id,
+                  flag_type_param:  'collusion_detected',
+                  severity_param:   severity,
+                  metadata_param: {
+                    ...sharedMeta,
+                    student_b_session_id: studentA.session_id,
+                    student_b_name:       studentA.student_name,
+                    student_b_email:      studentA.student_email,
+                  },
+                });
+              } catch (flagErr) {
+                console.error('[detect-collusion] Failed to insert flag for student B:', flagErr);
+              }
             }
           } catch (error) {
             console.error(
-              `Error comparing answers for question ${question.id}:`,
+              `[detect-collusion] Failed pair: ${studentA.student_name} vs ${studentB.student_name} for question ${question.id}`,
               error
             );
-            // Continue with next pair
           }
         }
       }
@@ -237,19 +295,15 @@ export async function POST(req: NextRequest) {
     // Sort by similarity descending
     flaggedPairs.sort((a, b) => b.similarity_percent - a.similarity_percent);
 
-    const criticalCount = flaggedPairs.filter(
-      (p) => p.verdict === 'likely_copied'
-    ).length;
-    const highCount = flaggedPairs.filter((p) => p.verdict === 'highly_similar').length;
+    const criticalCount = flaggedPairs.filter((p) => p.verdict === 'likely_copied').length;
+    const highCount     = flaggedPairs.filter((p) => p.verdict === 'highly_similar').length;
 
     let summary = `Analyzed ${totalPairsChecked} answer pairs across ${questionsToCheck.length} question(s). `;
     if (flaggedPairs.length === 0) {
       summary += 'No suspicious similarity detected.';
     } else {
       summary += `Found ${flaggedPairs.length} highly similar pair(s): ${criticalCount} likely copied, ${highCount} highly similar.`;
-      if (criticalCount > 0) {
-        summary += ' Manual review strongly recommended.';
-      }
+      if (criticalCount > 0) summary += ' Manual review strongly recommended.';
     }
 
     return NextResponse.json<CollusionResult>({
@@ -259,9 +313,9 @@ export async function POST(req: NextRequest) {
       summary,
     });
   } catch (err) {
-    console.error('detect-collusion error:', err);
+    console.error('[detect-collusion] Unhandled error:', err);
     return NextResponse.json(
-      { error: 'Internal server error' },
+      { error: 'Internal server error', details: err instanceof Error ? err.message : String(err) },
       { status: 500 }
     );
   }

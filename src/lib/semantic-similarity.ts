@@ -1,35 +1,36 @@
 /**
- * Semantic Similarity: Compare answers using Google Gemini embeddings
- * 
- * Uses text-embedding-004 model for semantic similarity detection.
- * Implements cosine similarity for comparing embedding vectors.
+ * Semantic Similarity: Compare answers using local TF-IDF + n-gram analysis
+ *
+ * No external API required. Combines TF-IDF cosine similarity with
+ * character n-gram overlap for robust collusion detection.
  */
 
-import { GoogleGenerativeAI } from '@google/generative-ai';
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-const genAI = new GoogleGenerativeAI(process.env.NEXT_PUBLIC_GOOGLE_API_KEY!);
+export type SimilarityVerdict = 'unique' | 'similar' | 'highly_similar' | 'likely_copied';
 
-/**
- * Get embedding vector for text using Gemini embeddings API
- * @param text - Text to embed
- * @returns Embedding vector as number[]
- */
-export async function getEmbedding(text: string): Promise<number[]> {
-  try {
-    const model = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+export interface SimilarityResult {
+  similarity: number;         // 0-1 cosine similarity
+  similarity_percent: number; // 0-100 for display
+  verdict: SimilarityVerdict;
+  explanation: string;
+}
 
-    const result = await model.embedContent(text);
-    const embedding = result.embedding;
+// ─── Internal helpers ─────────────────────────────────────────────────────────
 
-    if (!embedding || !embedding.values) {
-      throw new Error('No embedding returned from Gemini API');
-    }
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .split(/\s+/)
+    .filter(Boolean);
+}
 
-    return embedding.values;
-  } catch (error) {
-    console.error('Error getting embedding:', error);
-    throw error;
-  }
+function buildTFVector(tokens: string[], vocab: string[]): number[] {
+  const freq: Record<string, number> = {};
+  for (const t of tokens) freq[t] = (freq[t] ?? 0) + 1;
+  const len = tokens.length || 1;
+  return vocab.map(word => (freq[word] ?? 0) / len);
 }
 
 /**
@@ -43,7 +44,6 @@ export function cosineSimilarity(vecA: number[], vecB: number[]): number {
     throw new Error('Vectors must have the same length');
   }
 
-  // Compute dot product
   let dotProduct = 0;
   let magnitudeA = 0;
   let magnitudeB = 0;
@@ -57,158 +57,120 @@ export function cosineSimilarity(vecA: number[], vecB: number[]): number {
   magnitudeA = Math.sqrt(magnitudeA);
   magnitudeB = Math.sqrt(magnitudeB);
 
-  if (magnitudeA === 0 || magnitudeB === 0) {
-    return 0;
-  }
-
+  if (magnitudeA === 0 || magnitudeB === 0) return 0;
   return dotProduct / (magnitudeA * magnitudeB);
 }
 
-export type SimilarityVerdict = 'unique' | 'similar' | 'highly_similar' | 'likely_copied';
-
-export interface SimilarityResult {
-  similarity: number; // 0-1 cosine similarity
-  similarity_percent: number; // 0-100 for display
-  verdict: SimilarityVerdict;
-  explanation: string;
+/** Character n-gram Sørensen–Dice coefficient */
+function ngramSimilarity(a: string, b: string, n = 3): number {
+  const getNgrams = (s: string): Set<string> => {
+    const ngrams = new Set<string>();
+    for (let i = 0; i <= s.length - n; i++) ngrams.add(s.slice(i, i + n));
+    return ngrams;
+  };
+  const nA = getNgrams(a);
+  const nB = getNgrams(b);
+  if (nA.size === 0 && nB.size === 0) return 1;
+  if (nA.size === 0 || nB.size === 0) return 0;
+  const intersection = [...nA].filter(x => nB.has(x)).length;
+  return (2 * intersection) / (nA.size + nB.size);
 }
 
+/** TF-IDF cosine similarity over word tokens */
+function tfidfSimilarity(textA: string, textB: string): number {
+  const tokensA = tokenize(textA);
+  const tokensB = tokenize(textB);
+  if (tokensA.length === 0 && tokensB.length === 0) return 1;
+  if (tokensA.length === 0 || tokensB.length === 0) return 0;
+  const vocab = [...new Set([...tokensA, ...tokensB])];
+  return cosineSimilarity(buildTFVector(tokensA, vocab), buildTFVector(tokensB, vocab));
+}
+
+/** Longest Common Subsequence ratio */
+function lcsRatio(a: string, b: string): number {
+  const wa = tokenize(a);
+  const wb = tokenize(b);
+  if (wa.length === 0 || wb.length === 0) return 0;
+  const dp: number[][] = Array.from({ length: wa.length + 1 }, () =>
+    new Array(wb.length + 1).fill(0)
+  );
+  for (let i = 1; i <= wa.length; i++) {
+    for (let j = 1; j <= wb.length; j++) {
+      dp[i][j] = wa[i - 1] === wb[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return (2 * dp[wa.length][wb.length]) / (wa.length + wb.length);
+}
+
+/** Combine all three signals into a single 0-1 score */
+function combinedSimilarity(textA: string, textB: string): number {
+  const tfidf  = tfidfSimilarity(textA, textB);
+  const ngram  = ngramSimilarity(textA.toLowerCase(), textB.toLowerCase());
+  const lcs    = lcsRatio(textA, textB);
+  // Weighted blend: TF-IDF 50%, n-gram 30%, LCS 20%
+  return tfidf * 0.5 + ngram * 0.3 + lcs * 0.2;
+}
+
+function verdictFor(similarity: number): SimilarityVerdict {
+  if (similarity >= 0.95) return 'likely_copied';
+  if (similarity >= 0.85) return 'highly_similar';
+  if (similarity >= 0.70) return 'similar';
+  return 'unique';
+}
+
+function explanationFor(verdict: SimilarityVerdict, pct: number): string {
+  switch (verdict) {
+    case 'likely_copied':
+      return `Answers are nearly identical (${pct}% similarity). Very high probability of answer sharing or copying.`;
+    case 'highly_similar':
+      return `Answers are very similar (${pct}% similarity). Possible answer sharing or independent derivation from the same source.`;
+    case 'similar':
+      return `Answers show notable similarity (${pct}%). May represent legitimate similar approaches or shared understanding.`;
+    default:
+      return `Answers are substantially different (${pct}% similarity).`;
+  }
+}
+
+// ─── Public API (drop-in replacement) ────────────────────────────────────────
+
 /**
- * Compare two answers for semantic similarity
- * @param answerA - First student's answer
- * @param answerB - Second student's answer
- * @returns Similarity analysis with verdict
+ * Compare two answers for semantic similarity.
+ * Previously used Gemini embeddings; now uses local TF-IDF + n-gram + LCS.
  */
 export async function compareAnswers(
   answerA: string,
   answerB: string
 ): Promise<SimilarityResult> {
-  // Handle empty or very short answers
   const minLength = 5;
   if (answerA.trim().length < minLength || answerB.trim().length < minLength) {
     return {
       similarity: 0,
       similarity_percent: 0,
       verdict: 'unique',
-      explanation:
-        'One or both answers are too short to reliably compare for similarity.',
+      explanation: 'One or both answers are too short to reliably compare for similarity.',
     };
   }
 
-  try {
-    // Get embeddings for both answers
-    const [embeddingA, embeddingB] = await Promise.all([
-      getEmbedding(answerA),
-      getEmbedding(answerB),
-    ]);
+  const similarity = combinedSimilarity(answerA, answerB);
+  const similarity_percent = Math.round(similarity * 100);
+  const verdict = verdictFor(similarity);
 
-    // Compute cosine similarity
-    const similarity = cosineSimilarity(embeddingA, embeddingB);
-    const similarity_percent = Math.round(similarity * 100);
-
-    // Determine verdict based on thresholds
-    let verdict: SimilarityVerdict;
-    let explanation: string;
-
-    if (similarity >= 0.95) {
-      verdict = 'likely_copied';
-      explanation =
-        'Answers are nearly identical semantically. Very high probability of answer sharing or copying.';
-    } else if (similarity >= 0.85) {
-      verdict = 'highly_similar';
-      explanation =
-        'Answers are very similar in meaning and structure. Possible answer sharing or independent derivation from same source.';
-    } else if (similarity >= 0.7) {
-      verdict = 'similar';
-      explanation =
-        'Answers show notable similarity but may represent legitimate similar approaches or understanding.';
-    } else {
-      verdict = 'unique';
-      explanation = 'Answers are substantially different semantically.';
-    }
-
-    return {
-      similarity,
-      similarity_percent,
-      verdict,
-      explanation,
-    };
-  } catch (error) {
-    console.error('Error comparing answers:', error);
-    throw error;
-  }
+  return {
+    similarity,
+    similarity_percent,
+    verdict,
+    explanation: explanationFor(verdict, similarity_percent),
+  };
 }
 
 /**
- * Batch compare multiple pairs of answers efficiently
- * @param pairs - Array of answer pairs to compare
- * @returns Array of similarity results
+ * Batch compare multiple pairs of answers efficiently.
+ * Previously used Gemini embeddings with caching; now fully synchronous locally.
  */
 export async function compareAnswerBatch(
   pairs: Array<{ answerA: string; answerB: string }>
 ): Promise<SimilarityResult[]> {
-  // Get all embeddings in parallel
-  const answerTexts = new Set<string>();
-  pairs.forEach((p) => {
-    answerTexts.add(p.answerA);
-    answerTexts.add(p.answerB);
-  });
-
-  const embeddingMap = new Map<string, number[]>();
-
-  // Embed all unique answers to avoid redundant API calls
-  for (const text of answerTexts) {
-    try {
-      const embedding = await getEmbedding(text);
-      embeddingMap.set(text, embedding);
-    } catch (error) {
-      console.error(`Error embedding answer: ${error}`);
-      // Skip this answer
-    }
-  }
-
-  // Compare pairs using cached embeddings
-  const results: SimilarityResult[] = [];
-  for (const pair of pairs) {
-    const embA = embeddingMap.get(pair.answerA);
-    const embB = embeddingMap.get(pair.answerB);
-
-    if (!embA || !embB) {
-      results.push({
-        similarity: 0,
-        similarity_percent: 0,
-        verdict: 'unique',
-        explanation: 'Could not embed one or both answers.',
-      });
-      continue;
-    }
-
-    try {
-      const similarity = cosineSimilarity(embA, embB);
-      const similarity_percent = Math.round(similarity * 100);
-
-      let verdict: SimilarityVerdict;
-      if (similarity >= 0.95) verdict = 'likely_copied';
-      else if (similarity >= 0.85) verdict = 'highly_similar';
-      else if (similarity >= 0.7) verdict = 'similar';
-      else verdict = 'unique';
-
-      results.push({
-        similarity,
-        similarity_percent,
-        verdict,
-        explanation: `Semantic similarity: ${similarity_percent}%. ${verdict === 'likely_copied' ? 'Possible answer sharing detected.' : verdict === 'highly_similar' ? 'High similarity detected.' : verdict === 'similar' ? 'Moderate similarity detected.' : 'Answers appear distinct.'}`,
-      });
-    } catch (error) {
-      console.error('Error computing similarity:', error);
-      results.push({
-        similarity: 0,
-        similarity_percent: 0,
-        verdict: 'unique',
-        explanation: 'Error computing similarity.',
-      });
-    }
-  }
-
-  return results;
+  return Promise.all(pairs.map(({ answerA, answerB }) => compareAnswers(answerA, answerB)));
 }

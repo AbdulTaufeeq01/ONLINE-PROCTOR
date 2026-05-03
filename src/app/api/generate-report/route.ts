@@ -34,7 +34,7 @@ async function generateAIInsight(
   flags: FlagSummary[],
   behaviorSummary: Record<string, number>
 ): Promise<string> {
-  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' })
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
 
   const flagsSummary =
     flags.length > 0

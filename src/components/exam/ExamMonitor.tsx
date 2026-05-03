@@ -2,7 +2,11 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { Card } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { toast } from 'sonner';
+import { TrendingUp, X } from 'lucide-react';
 import { createSupabaseBrowserClient } from '@/lib/supabase/client';
 
 interface Invite {
@@ -43,22 +47,11 @@ interface Flag {
   created_at: string;
 }
 
-interface BehaviorLog {
-  id: string;
-  session_id: string;
-  student_id: string | null;
-  event_type: string;
-  confidence: number;
-  metadata: Record<string, unknown> | null;
-  created_at: string;
-}
-
 interface ExamMonitorProps {
   exam: { id: string; title: string; status: string };
   initialInvites: Invite[];
   initialSessions: ExamSession[];
   initialFlags: Flag[];
-  initialBehaviorLogs: BehaviorLog[];
   initialProfiles: Profile[];
   totalQuestions: number;
 }
@@ -69,16 +62,18 @@ export default function ExamMonitor({
   initialSessions,
   initialProfiles,
   initialFlags,
-  initialBehaviorLogs,
   totalQuestions,
 }: ExamMonitorProps) {
+  const router = useRouter();
   const [sessions, setSessions] = useState<ExamSession[]>(initialSessions ?? []);
   const [flags, setFlags] = useState<Flag[]>(initialFlags ?? []);
-  const [behaviorLogs, setBehaviorLogs] = useState<BehaviorLog[]>(initialBehaviorLogs ?? []);
   const [invites, setInvites] = useState<Invite[]>(initialInvites ?? []);
   const [profiles, setProfiles] = useState<Profile[]>(initialProfiles ?? []);
   const [now, setNow] = useState(new Date());
   const [isLive, setIsLive] = useState(true);
+  const [isCollusionLoading, setIsCollusionLoading] = useState(false);
+  const [collusionResults, setCollusionResults] = useState<any[] | null>(null);
+  const [showCollusionModal, setShowCollusionModal] = useState(false);
 
   // Update time every second for elapsed time calculation
   useEffect(() => {
@@ -131,24 +126,6 @@ export default function ExamMonitor({
           setIsLive(false);
           setTimeout(() => setIsLive(true), 2000);
           setFlags((prev) => [payload.new as Flag, ...prev]);
-        }
-      )
-      .subscribe();
-
-    const behaviorChannel = supabase
-      .channel(`behavior-${exam.id}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'behavior_logs',
-          filter: `exam_id=eq.${exam.id}`,
-        },
-        (payload) => {
-          setIsLive(false);
-          setTimeout(() => setIsLive(true), 2000);
-          setBehaviorLogs((prev) => [payload.new as BehaviorLog, ...prev]);
         }
       )
       .subscribe();
@@ -244,7 +221,37 @@ export default function ExamMonitor({
 
   const inProgressCount = sessions.filter((s) => s.status === 'in_progress').length;
   const submittedCount  = sessions.filter((s) => s.status === 'submitted').length;
-  const highRiskCount   = sessions.filter((s) => s.cheating_score != null && s.cheating_score > 0.7).length;
+  const highRiskCount   = sessions.filter((s) => {
+    const score = typeof s.cheating_score === 'number'
+      ? (s.cheating_score <= 1 ? s.cheating_score * 100 : s.cheating_score)
+      : null;
+    return score != null && score > 70;
+  }).length;
+
+  const openStudentDetails = (inviteId: string) => {
+    router.push(`/teacher/exam/${exam.id}/student/${inviteId}`);
+  };
+
+  const handleRunCollusion = async () => {
+    try {
+      setIsCollusionLoading(true);
+      const res = await fetch('/api/detect-collusion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exam_id: exam.id }),
+      });
+      if (!res.ok) throw new Error('Failed to run collusion detection');
+      const data = await res.json();
+      setCollusionResults(data.flagged_pairs || []);
+      setShowCollusionModal(true);
+      toast.success(`Found ${data.flagged_pairs?.length || 0} potential collusion pairs`);
+    } catch (err) {
+      console.error('Collusion detection error:', err);
+      toast.error('Failed to run collusion detection');
+    } finally {
+      setIsCollusionLoading(false);
+    }
+  };
 
   return (
     <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -264,6 +271,14 @@ export default function ExamMonitor({
             </p>
           </div>
           <div className="flex items-center gap-4">
+            <Button
+              onClick={handleRunCollusion}
+              disabled={isCollusionLoading}
+              className="bg-blue-600 hover:bg-blue-700 text-white font-medium flex items-center gap-2"
+            >
+              <TrendingUp className="h-4 w-4" />
+              {isCollusionLoading ? 'Analyzing...' : 'Run Collusion Check'}
+            </Button>
             <div className="flex items-center gap-2">
               <div
                 className={`h-3 w-3 rounded-full ${
@@ -318,232 +333,322 @@ export default function ExamMonitor({
       </div>
 
       {/* Main Content Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Left Column: Student Status */}
-        <div className="lg:col-span-2">
-          <Card className="p-6 border border-gray-200">
-            <div className="space-y-4">
-              <h2 className="text-xl font-bold text-gray-900">Student Status</h2>
+      <div className="grid grid-cols-1 gap-6">
+        <Card className="p-6 border border-gray-200">
+          <div className="space-y-4">
+            <h2 className="text-xl font-bold text-gray-900">Student Status</h2>
 
-              {invites.length === 0 ? (
-                <div className="flex items-center justify-center py-12">
-                  <p className="text-gray-500 text-center">No students invited yet</p>
-                </div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b border-gray-200 bg-gray-50">
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Student</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Status</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Progress</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Time</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Score</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Risk</th>
-                        <th className="px-4 py-3 text-left font-semibold text-gray-700">Flags</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {invites.map((invite) => {
-                        const session = sessions.find((s) => s.invite_id === invite.id);
-                        const status = session?.status || 'not_started';
-                        const answeredQuestions = getAnsweredQuestions(session);
-                        const progressPercent =
-                          totalQuestions > 0
-                            ? Math.round((answeredQuestions / totalQuestions) * 100)
-                            : 0;
-                        const flagCount = session ? getFlagCount(session.id) : 0;
-                        const cheatingScoreValue =
-                          typeof session?.cheating_score === 'number'
-                            ? (session.cheating_score <= 1
-                                ? session.cheating_score * 100
-                                : session.cheating_score)
-                            : null;
-
-                        return (
-                          <tr
-                            key={invite.id}
-                            className="border-b border-gray-100 hover:bg-gray-50 transition-colors"
-                          >
-                            <td className="px-4 py-3">
-                              <div className="font-medium text-gray-900">
-                                {getStudentName(session, invite)}
-                              </div>
-                              <div className="text-xs text-gray-500">{invite.student_email}</div>
-                            </td>
-                            <td className="px-4 py-3">
-                              <span
-                                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getSessionStatusColor(status)}`}
-                              >
-                                {status === 'not_started'
-                                  ? 'Not Started'
-                                  : status.charAt(0).toUpperCase() + status.slice(1).replace('_', ' ')}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className="flex items-center gap-2">
-                                <div className="w-24 bg-gray-200 rounded-full h-2">
-                                  <div
-                                    className="bg-indigo-600 h-2 rounded-full transition-all duration-300"
-                                    style={{ width: `${progressPercent}%` }}
-                                  />
-                                </div>
-                                <span className="text-xs font-medium text-gray-700 whitespace-nowrap">
-                                  {answeredQuestions}/{totalQuestions}
-                                </span>
-                              </div>
-                            </td>
-                            <td className="px-4 py-3 text-gray-700 font-mono text-xs">
-                              {calculateTimeElapsed(
-                                session?.started_at ?? null,
-                                session?.submitted_at ?? null
-                              )}
-                            </td>
-                            <td className="px-4 py-3 text-gray-700">
-                              {session?.score != null && session?.max_score != null
-                                ? `${session.score}/${session.max_score}`
-                                : '—'}
-                            </td>
-                            <td className="px-4 py-3">
-                              {cheatingScoreValue != null ? (
-                                <span
-                                  className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
-                                    cheatingScoreValue > 70
-                                      ? 'bg-red-100 text-red-800'
-                                      : cheatingScoreValue > 40
-                                      ? 'bg-yellow-100 text-yellow-800'
-                                      : 'bg-green-100 text-green-800'
-                                  }`}
-                                >
-                                  {cheatingScoreValue.toFixed(0)}%
-                                </span>
-                              ) : (
-                                <span className="text-gray-400">—</span>
-                              )}
-                            </td>
-                            <td className="px-4 py-3">
-                              {flagCount > 0 ? (
-                                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800">
-                                  {flagCount}
-                                </span>
-                              ) : (
-                                <span className="text-gray-400">—</span>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </Card>
-        </div>
-
-        {/* Right Column: Activity Feed */}
-        <div className="lg:col-span-1">
-          <Card className="p-6 border border-gray-200">
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-gray-900">Recent Activity</h2>
-                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-orange-100 text-orange-800">
-                  {flags.length + behaviorLogs.length}
-                </span>
+            {invites.length === 0 ? (
+              <div className="flex items-center justify-center py-12">
+                <p className="text-gray-500 text-center">No students invited yet</p>
               </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-200 bg-gray-50">
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Student</th>
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Status</th>
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Progress</th>
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Time</th>
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Score</th>
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Risk</th>
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Flags</th>
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Action</th>
+                      <th className="px-4 py-3 text-left font-semibold text-gray-700">Answers</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {invites.map((invite) => {
+                      const session = sessions.find((s) => s.invite_id === invite.id);
+                      const status = session?.status || 'not_started';
+                      const answeredQuestions = getAnsweredQuestions(session);
+                      const progressPercent =
+                        totalQuestions > 0
+                          ? Math.round((answeredQuestions / totalQuestions) * 100)
+                          : 0;
+                      const flagCount = session ? getFlagCount(session.id) : 0;
+                      const cheatingScoreValue =
+                        typeof session?.cheating_score === 'number'
+                          ? (session.cheating_score <= 1
+                              ? session.cheating_score * 100
+                              : session.cheating_score)
+                          : null;
 
-              {flags.length === 0 && behaviorLogs.length === 0 ? (
-                <div className="flex items-center justify-center py-12">
-                  <p className="text-gray-500 text-center">No activity yet</p>
+                      return (
+                        <tr
+                          key={invite.id}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => openStudentDetails(invite.id)}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault();
+                              openStudentDetails(invite.id);
+                            }
+                          }}
+                          className="cursor-pointer border-b border-gray-100 transition-colors hover:bg-gray-50 focus:bg-gray-50"
+                        >
+                          <td className="px-4 py-3">
+                            <div className="font-medium text-gray-900">
+                              {getStudentName(session, invite)}
+                            </div>
+                            <div className="text-xs text-gray-500">{invite.student_email}</div>
+                          </td>
+                          <td className="px-4 py-3">
+                            <span
+                              className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getSessionStatusColor(status)}`}
+                            >
+                              {status === 'not_started'
+                                ? 'Not Started'
+                                : status.charAt(0).toUpperCase() + status.slice(1).replace('_', ' ')}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-2">
+                              <div className="w-24 bg-gray-200 rounded-full h-2">
+                                <div
+                                  className="bg-indigo-600 h-2 rounded-full transition-all duration-300"
+                                  style={{ width: `${progressPercent}%` }}
+                                />
+                              </div>
+                              <span className="text-xs font-medium text-gray-700 whitespace-nowrap">
+                                {answeredQuestions}/{totalQuestions}
+                              </span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 text-gray-700 font-mono text-xs">
+                            {calculateTimeElapsed(
+                              session?.started_at ?? null,
+                              session?.submitted_at ?? null
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-gray-700">
+                            {session?.score != null && session?.max_score != null
+                              ? `${session.score}/${session.max_score}`
+                              : '—'}
+                          </td>
+                          <td className="px-4 py-3">
+                            {cheatingScoreValue != null ? (
+                              <span
+                                className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                                  cheatingScoreValue > 70
+                                    ? 'bg-red-100 text-red-800'
+                                    : cheatingScoreValue > 40
+                                    ? 'bg-yellow-100 text-yellow-800'
+                                    : 'bg-green-100 text-green-800'
+                                }`}
+                              >
+                                {cheatingScoreValue.toFixed(0)}%
+                              </span>
+                            ) : (
+                              <span className="text-gray-400">—</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            {flagCount > 0 ? (
+                              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800">
+                                {flagCount}
+                              </span>
+                            ) : (
+                              <span className="text-gray-400">—</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openStudentDetails(invite.id);
+                              }}
+                            >
+                              View Details
+                            </Button>
+                          </td>
+                          <td className="px-4 py-3">
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                router.push(`/teacher/exam/${exam.id}/review/${invite.id}`);
+                              }}
+                            >
+                              Review Answers
+                            </Button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </Card>
+
+      </div>
+
+      {/* Collusion Detection Section */}
+      <div className="mt-8">
+        <Card className="p-6 border border-gray-200">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h2 className="text-xl font-bold text-gray-900">Collusion Detection</h2>
+              <p className="text-sm text-gray-600 mt-1">Analyze answers for suspicious similarity</p>
+            </div>
+            <Button
+              onClick={handleRunCollusion}
+              disabled={isCollusionLoading}
+              className="bg-indigo-600 hover:bg-indigo-700 text-white"
+            >
+              {isCollusionLoading ? 'Analyzing...' : 'Run Collusion Check'}
+            </Button>
+          </div>
+
+          {collusionResults === null ? (
+            <div className="text-center py-8 text-gray-500">
+              <p>Click "Run Collusion Check" to analyze answers for unusual similarity</p>
+            </div>
+          ) : collusionResults.length === 0 ? (
+            <div className="text-center py-8 bg-green-50 rounded border border-green-200">
+              <p className="text-green-800">✓ No suspicious answer similarity detected</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {collusionResults.map((pair, idx) => (
+                <div
+                  key={idx}
+                  className={`p-4 rounded border-l-4 ${
+                    pair.similarity_percent >= 85
+                      ? 'border-l-red-500 bg-red-50'
+                      : pair.similarity_percent >= 70
+                      ? 'border-l-orange-500 bg-orange-50'
+                      : 'border-l-yellow-500 bg-yellow-50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="font-semibold text-gray-900">
+                        {pair.student_a_name} ↔ {pair.student_b_name}
+                      </p>
+                      <p className="text-sm text-gray-600 mt-1">
+                        Q: {pair.question_text?.substring(0, 60)}...
+                      </p>
+                      <p className="text-xs text-gray-500 mt-2">{pair.explanation}</p>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-2xl font-bold text-gray-900">
+                        {pair.similarity_percent}%
+                      </div>
+                      <div
+                        className={`text-xs font-semibold mt-1 px-2 py-1 rounded ${
+                          pair.similarity_percent >= 85
+                            ? 'bg-red-200 text-red-800'
+                            : pair.similarity_percent >= 70
+                            ? 'bg-orange-200 text-orange-800'
+                            : 'bg-yellow-200 text-yellow-800'
+                        }`}
+                      >
+                        {pair.similarity_percent >= 85
+                          ? 'CRITICAL'
+                          : pair.similarity_percent >= 70
+                          ? 'HIGH'
+                          : 'MEDIUM'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* Collusion Results Modal */}
+      {showCollusionModal && collusionResults && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <Card className="w-full max-w-2xl max-h-[80vh] overflow-y-auto">
+            <div className="sticky top-0 bg-white border-b border-gray-200 p-6 flex items-center justify-between">
+              <div>
+                <h2 className="text-2xl font-bold text-gray-900">Collusion Detection Results</h2>
+                <p className="text-sm text-gray-600 mt-1">
+                  Found {collusionResults.length} potential collusion pairs
+                </p>
+              </div>
+              <button
+                onClick={() => setShowCollusionModal(false)}
+                className="text-gray-500 hover:text-gray-700"
+              >
+                <X className="h-6 w-6" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              {collusionResults.length === 0 ? (
+                <div className="text-center py-12">
+                  <p className="text-gray-600">No collusion detected</p>
                 </div>
               ) : (
-                <div className="space-y-3 max-h-[600px] overflow-y-auto">
-                  {flags.slice(0, 15).map((flag) => {
-                    const session = sessions.find((s) => s.id === flag.session_id);
-                    const invite = invites.find((inv) => inv.id === session?.invite_id);
-                    const studentName = getStudentName(session, invite!);
+                collusionResults.map((pair, idx) => {
+                  const similarity = pair.similarity_percent || 0;
+                  const getSimilarityColor = (percent: number) => {
+                    if (percent >= 85) return 'bg-red-50 border-red-200';
+                    if (percent >= 70) return 'bg-orange-50 border-orange-200';
+                    return 'bg-yellow-50 border-yellow-200';
+                  };
 
-                    return (
-                      <div
-                        key={`flag-${flag.id}`}
-                        className={`p-3 bg-gray-50 rounded border ${getBorderColor(flag.severity)}`}
-                      >
-                        <div className="space-y-2">
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="font-semibold text-gray-900 text-sm">
-                              🚩 {formatType(flag.flag_type)}
-                            </div>
-                            <span
-                              className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium whitespace-nowrap ${getSeverityBadgeColor(flag.severity)}`}
-                            >
-                              {flag.severity.charAt(0).toUpperCase() + flag.severity.slice(1)}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="text-gray-600">{studentName}</span>
-                            <span className="text-gray-500">{formatTime(flag.created_at)}</span>
-                          </div>
-                          {flag.screenshot_url && (
-                            <div className="pt-1">
-                              <a
-                                href={flag.screenshot_url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="inline-block"
-                              >
-                                <img
-                                  src={flag.screenshot_url}
-                                  alt="Flag screenshot"
-                                  className="h-12 w-12 object-cover rounded border border-gray-300 hover:opacity-80 transition-opacity cursor-pointer"
-                                />
-                              </a>
-                            </div>
-                          )}
+                  const getSimilarityBadgeColor = (percent: number) => {
+                    if (percent >= 85) return 'bg-red-100 text-red-800';
+                    if (percent >= 70) return 'bg-orange-100 text-orange-800';
+                    return 'bg-yellow-100 text-yellow-800';
+                  };
+
+                  return (
+                    <div
+                      key={idx}
+                      className={`border rounded-lg p-4 ${getSimilarityColor(similarity)}`}
+                    >
+                      <div className="flex items-start justify-between mb-3">
+                        <div>
+                          <p className="font-semibold text-gray-900">
+                            {pair.student_a || 'Student A'} ↔ {pair.student_b || 'Student B'}
+                          </p>
+                          <p className="text-sm text-gray-600">
+                            Question {pair.question_number || 'N/A'}
+                          </p>
                         </div>
+                        <span className={`px-3 py-1 rounded-full text-sm font-medium ${getSimilarityBadgeColor(similarity)}`}>
+                          {similarity.toFixed(1)}% Similar
+                        </span>
                       </div>
-                    );
-                  })}
 
-                  {behaviorLogs.slice(0, 15).map((log) => {
-                    const session = sessions.find((s) => s.id === log.session_id);
-                    const invite = invites.find((inv) => inv.id === session?.invite_id);
-                    const studentName = getStudentName(session, invite!);
-
-                    return (
-                      <div
-                        key={`behavior-${log.id}`}
-                        className="p-3 bg-blue-50 rounded border border-l-4 border-l-blue-400"
-                      >
-                        <div className="space-y-2">
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="font-semibold text-gray-900 text-sm">
-                              📊 {formatType(log.event_type)}
-                            </div>
-                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 whitespace-nowrap">
-                              {((log.confidence || 0) * 100).toFixed(0)}% conf
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="text-gray-600">{studentName}</span>
-                            <span className="text-gray-500">{formatTime(log.created_at)}</span>
-                          </div>
+                      <div className="space-y-2 text-sm">
+                        <div>
+                          <p className="font-medium text-gray-700">Verdict: {pair.verdict || 'Similar'}</p>
                         </div>
+                        {pair.explanation && (
+                          <p className="text-gray-600 italic">{pair.explanation}</p>
+                        )}
                       </div>
-                    );
-                  })}
-
-                  {flags.length + behaviorLogs.length > 15 && (
-                    <div className="pt-2 text-center text-xs text-gray-500">
-                      And {flags.length + behaviorLogs.length - 15} more event
-                      {flags.length + behaviorLogs.length - 15 !== 1 ? 's' : ''}...
                     </div>
-                  )}
-                </div>
+                  );
+                })
               )}
+            </div>
+
+            <div className="border-t border-gray-200 bg-gray-50 p-6 flex justify-end gap-3">
+              <Button
+                onClick={() => setShowCollusionModal(false)}
+                className="bg-gray-600 hover:bg-gray-700 text-white"
+              >
+                Close
+              </Button>
             </div>
           </Card>
         </div>
-      </div>
+      )}
     </main>
   );
 }

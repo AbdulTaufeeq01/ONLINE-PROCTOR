@@ -55,12 +55,7 @@ export default async function MonitorPage({
     .eq('exam_id', id)
     .order('created_at', { ascending: false });
 
-  // Step 6: Fetch behavior logs
-  const { data: behaviorLogs = [] } = await (supabase.from('behavior_logs') as any)
-    .select('*')
-    .eq('exam_id', id);
-
-  // Step 7: Fetch profiles for the students in sessions
+  // Step 6: Fetch profiles for the students in sessions
   const studentIds = sessions.map((s: any) => s.student_id).filter(Boolean);
   const { data: profiles = [] } = studentIds.length > 0
     ? await (supabase.from('profiles') as any)
@@ -68,7 +63,7 @@ export default async function MonitorPage({
         .in('id', studentIds)
     : { data: [] };
 
-  // Step 8: Fetch total questions for this exam
+  // Step 7: Fetch total questions for this exam
   const { data: questions = [] } = await (supabase.from('questions') as any)
     .select('id')
     .eq('exam_id', id);
@@ -81,7 +76,6 @@ export default async function MonitorPage({
         initialSessions={sessions ?? []}
         initialInvites={invites ?? []}
         initialFlags={flags ?? []}
-        initialBehaviorLogs={behaviorLogs ?? []}
         initialProfiles={profiles ?? []}
         totalQuestions={questions?.length ?? 0}
       />
