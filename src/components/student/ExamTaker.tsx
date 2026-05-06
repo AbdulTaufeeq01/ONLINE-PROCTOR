@@ -790,6 +790,10 @@ export function ExamTaker({ exam, session, questions: initialQuestions, invite }
     if (isSubmitting) return;
     setIsSubmitting(true);
 
+    // Set examStarted to false FIRST to prevent listeners from registering tab switches during submission
+    examStartedRef.current = false;
+    
+    // Then stop the intervals
     if (detectionIntervalRef.current) clearInterval(detectionIntervalRef.current);
     if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
 
